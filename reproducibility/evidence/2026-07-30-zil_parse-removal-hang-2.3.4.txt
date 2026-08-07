@@ -1,0 +1,74 @@
+ZFS 2.3.4 Finding 10 Reproduction Attempt
+============================================
+
+Date: 2026-07-30
+Host: Apple Silicon (arm64), macOS 26.5.2, Lima 2.2.0 (vz)
+Guest: Debian 13.6 (Trixie), kernel 6.12.95+deb13-cloud-arm64, aarch64
+ZFS: built from source, tag zfs-2.3.4 (NOT the incident's build; see Conclusion)
+     Provenance re-verified 2026-07-31: module embeds zfs-2.3.4-0-g34f96a1,
+     i.e. zero commits past the tag. Clean release-tag build, no local patches.
+
+Test: 07-path-h-yank-live-log.sh (finding 10)
+----------------------------------------------
+
+Procedure:
+1. Created pool with log vdev backed by dm-linear (slogdev over loop0)
+2. Drove sync writes so ZIL chain is live on the log
+3. Unmounted ds1 so its ZIL cannot drain and zh_log stays non-zero
+4. Recorded vs_alloc = 43.9M (non-zero) on the log vdev
+5. Swapped dm table to error target (simulating flickering SSD)
+6. Log device went FAULTED with "too many errors"
+7. vs_alloc dropped to 72K (near zero but not zero)
+8. Attempted `zpool remove ziltest slogdev`
+
+Result:
+- The `zpool remove` command HUNG (did not return within 120 seconds)
+- This is the SAME behavior as ZFS 2.2.2
+- The VM required forced power cycle to recover
+
+*** EVIDENCE LIMITATION -- READ THIS ***
+NO STACK TRACE WAS CAPTURED ON THIS RUN.
+
+What was observed on 2.3.4 is that `zpool remove` did not return within 120
+seconds and the VM had to be force-stopped. That is all.
+
+The statement made in earlier versions of this file, that "the hang is in
+zil_parse() -> arc_read() -> zio_wait()", was an INFERENCE carried over from
+the 2.2.2 run, not an observation on 2.3.4. It has been removed from the
+Result list above. The 2.2.2 capture
+(2026-07-29-zil_parse-removal-hang-2.2.2.txt) is the only one in this
+repository with a verified stack for this hang.
+(Correction, 2026-07-31: true when written. Finding 14 later the same day
+added a second verified stack, on zfs-2.4.3, corroborated by the kernel
+hung-task watchdog; see the 2026-07-31 files.)
+
+Anyone rerunning this should capture /proc/<pid>/stack from a second shell
+BEFORE force-stopping the VM.
+
+Conclusion:
+-----------
+ZFS 2.3.4 hangs unkillably on this path, as 2.2.2 does. The hang is
+reproducible on both versions tested.
+
+Supported by this run:
+- Nothing tested distinguishes 2.3.4 from 2.2.2
+
+NOT supported by this run:
+- That the 2.3.4 hang is at the same stack frame (no stack captured)
+- Anything about 2.4.1. This script (07) was NEVER run on 2.4.1. Earlier text
+  in this file and elsewhere in the repository listed 2.4.1 alongside 2.2.2
+  here; that was wrong and has been withdrawn. 2.4.1 was the baseline for the
+  PRECONDITION hypotheses (scripts 01, 03, 04, 05), not for this hang.
+- That this is the incident's ZFS build. It is not. The incident ran
+  zfs-2.3.3-107-gec5aa9bfd; this VM built the zfs-2.3.4 release tag.
+- That the mechanism is "zil_parse() has no error path". That claim was wrong
+  and has been withdrawn repo-wide; zil_parse() has an error path that is
+  never reached. Why the ZIO never completes is UNKNOWN, and ../../CLAIMS.md
+  4.9 makes the question sharper: on a plain source reading this read should
+  have failed fast with ENOTSUP rather than blocking at all.
+
+Evidence captured before timeout:
+- vs_alloc before yank: 43.9M
+- vs_alloc after yank: 72K
+- Log device state: FAULTED
+- Pool state: DEGRADED

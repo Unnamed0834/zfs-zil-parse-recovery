@@ -1,0 +1,39 @@
+This repository is dual-licensed. The two kinds of content have different
+origins and therefore different terms.
+
+  1. PATCHES
+     Everything in patches/, and any diff or code fragment derived from OpenZFS
+     source that appears elsewhere in this repository.
+
+     Licensed under the Common Development and Distribution License,
+     Version 1.0 (CDDL-1.0), the same license as OpenZFS itself, so that these
+     changes can be submitted upstream without a licensing obstacle.
+
+     SPDX-License-Identifier: CDDL-1.0
+     Full text: https://opensource.org/license/cddl-1-0
+     See: LICENSE-patches
+
+   2. DOCUMENTATION, ANALYSIS AND TEST SCRIPTS
+      Everything else, including README.md, CONCLUSIONS.md, CLAIMS.md,
+      incident/, reproducibility/, and the shell scripts and
+      captured evidence in reproducibility/.
+
+     Licensed under the Creative Commons Attribution 4.0 International
+     license (CC BY 4.0). Reuse is welcome, including commercially, provided
+     credit is given.
+
+     SPDX-License-Identifier: CC-BY-4.0
+     Full text: https://creativecommons.org/licenses/by/4.0/legalcode
+     See: LICENSE-docs
+
+Copyright (c) 2026 Unnamed0834
+
+Suggested attribution for the documentation:
+
+    ZFS SLOG hole-vdev recovery, Unnamed0834, 2026.
+    https://github.com/Unnamed0834/zfs-zil-parse-recovery
+
+A note on the shell scripts in reproducibility/: these are original work and are not
+derived from OpenZFS source, so they fall under CC BY 4.0 above. If any of them
+is later contributed to the OpenZFS test suite, that contribution would be made
+under CDDL-1.0 to match the project.

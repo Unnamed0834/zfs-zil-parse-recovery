@@ -1,0 +1,320 @@
+failmode on ZFS 2.4.3, and the SPA_LOG_CLEAR persistence question
+==================================================================
+
+Date:  2026-07-31
+Host:  Apple Silicon (arm64), macOS 26.6, Lima 2.2.0 (vz)
+Guest: Debian 13 (Trixie), kernel 6.12.95+deb13-cloud-arm64, aarch64
+VM:    zfs243
+ZFS:   built from source, tag zfs-2.4.3, commit 83020cf, module zfs-2.4.3-0-g83020cf
+
+Three experiments in one session:
+  1.  07-path-h-yank-live-log.sh at FAILMODE=continue
+  1b. 07-path-h-yank-live-log.sh at FAILMODE=panic
+  3.  does SPA_LOG_CLEAR survive an export/import cycle? (claim 1.13)
+
+
+BACKGROUND: THE PREDICTION BEING TESTED
+---------------------------------------
+Every run in ATTEMPTS.md before today used the default failmode=wait, and
+CLAIMS.md 2.6 recorded "why the ZIO never completes" as UNKNOWN.
+
+Reading the source for finding 14 produced a specific, falsifiable prediction.
+zio_vdev_io_start() marks I/O to an inaccessible leaf vdev ENXIO before it ever
+reaches the device:
+
+    /* zio.c:4789-4792 */
+    if (!vdev_accessible(vd, zio)) {
+            zio->io_error = SET_ERROR(ENXIO);
+            zio_interrupt(zio);
+            return (NULL);
+    }
+
+and vdev_accessible() is false whenever vdev_is_dead() (vdev.c:4795). The
+suspend at zio.c:5714-5720 then requires ALL THREE of:
+
+    zio->io_error == ENXIO
+    spa_load_state(zio->io_spa) == SPA_LOAD_NONE
+    spa_get_failmode(zio->io_spa) != ZIO_FAILURE_MODE_CONTINUE
+
+In the removal case in the test environment, all three hold: the log is FAULTED so vdev_is_dead() is
+true and the error is ENXIO; the pool is imported and live so the load state is
+SPA_LOAD_NONE; and failmode is wait. Prediction: setting failmode=continue
+breaks the third conjunct and the hang should disappear.
+
+(Note this is the case in the test environment only. In the INCIDENT import case the second
+conjunct fails -- spa_load_state is SPA_LOAD_IMPORT, not SPA_LOAD_NONE -- so
+the suspend cannot fire there, and CANFAIL disarms the catch-all at
+zio.c:5722-5724. That is CLAIMS.md 4.9, and it remains open. See "What this
+does not explain" at the end.)
+
+
+EXPERIMENT 1: FAILMODE=continue
+-------------------------------
+    FAILMODE=continue sudo -E ./07-path-h-yank-live-log.sh
+
+Identical setup to the hanging run recorded in
+2026-07-31-zfs-2.4.3-test-results.txt. Same script, same build, same state:
+
+    vs_alloc before yank:  43.9M   (log ONLINE)
+    vs_alloc after yank:   72K     (NON-zero, so spa_reset_logs() runs)
+    log vdev state:        FAULTED, "too many errors"
+    pool state:            DEGRADED
+
+One variable changed. Result:
+
+    === 7. remove the log vdev ===
+        log identifier: slogdev
+        remove exit=0
+
+    NO PROCESS IN D-STATE.
+    The removal COMPLETED. The script ran to the end.
+
+    config:
+        NAME                   STATE     READ WRITE CKSUM
+        ziltest                ONLINE       0     0     0
+          /var/tmp/ziltest/d1  ONLINE       0     0     0
+          /var/tmp/ziltest/d2  ONLINE       0     0     0
+    errors: No known data errors
+
+    vdev tree after:  hole_array[0]: 2, vdev_children: 3, is_hole: 1
+    ZIL headers:      ALL CLEARED (no "ZIL header:" line for mos,
+                      ziltest, or ziltest/ds1)
+
+**THE PREDICTION HOLDS.** failmode=continue removes the hang. This is a clean
+controlled experiment: same script, same version, same reproduced device
+failure, one variable, opposite outcome.
+
+Underlying I/O errors were logged, confirming the reads really did fail:
+
+    zio pool=ziltest vdev=/dev/mapper/slogdev error=5 type=1 offset=270336 ...
+    zio pool=ziltest vdev=/dev/mapper/slogdev error=5 type=1 offset=536354816 ...
+    zio pool=ziltest vdev=/dev/mapper/slogdev error=5 type=1 offset=536616960 ...
+
+
+TWO SECONDARY RESULTS FROM THIS RUN
+-----------------------------------
+(a) THE PRECONDITION WAS **NOT** PRODUCED. Before the run it was speculated
+    that failmode=continue might be the missing route to the hole-plus-dirty-
+    header state, on the theory that spa_reset_logs() could now fail partway
+    without hanging, and that zil_destroy_sync()'s discarded return would let
+    the removal proceed with a header uncleared.
+
+    That speculation is WRONG and is recorded here as ruled out. Every zh_log
+    was cleared. zil_sync() zeroes the header at zl_destroy_txg regardless of
+    whether zil_parse() errored, so the discarded error does not strand a
+    header. Hypothesis retired.
+
+(b) PATCH F NOW HAS A REPRODUCIBLE CASE. reproducibility/patches/README.md
+    states, under "Known open questions in this patch", that no ZTS coverage is
+    proposed "because the condition being handled -- a zil_parse() that returns
+    an error rather than hanging -- has not been produced in the lab."
+
+    It has now. At failmode=continue the read fails fast, zil_parse() returns
+    an error, zil_destroy_sync() discards it via the (void) cast, zil_destroy()
+    drops it, and `zpool remove` reports exit 0 as though nothing went wrong.
+    That is exactly the gap Patch F addresses (claim 3.21), reproduced on
+    demand. A ZTS test for Patch F can be built from
+    `FAILMODE=continue ./07-path-h-yank-live-log.sh`.
+
+    Note no "ZFS read log block error" appeared in dmesg. zil_parse() only
+    emits that cmn_err when `claimed` is true (zh_claim_txg != 0), which it is
+    not here. So the error is discarded silently, with no user-visible
+    trace at all. That strengthens the case for Patch F.
+
+
+EXPERIMENT 1b: FAILMODE=panic
+-----------------------------
+    FAILMODE=panic sudo -E ./07-path-h-yank-live-log.sh
+
+FIRST ATTEMPT WAS INCONCLUSIVE AND IS RECORDED AS SUCH. The guest became
+unreachable about 60 s in, but NO panic text could be produced: /proc/consoles
+showed only tty0, so kernel messages never reached Lima's serial log, and the
+journal is lost on panic. Absence of panic output proved nothing. Rather than
+record an inference, the VM's kernel cmdline was changed to
+
+    console=tty0 console=hvc0 ignore_loglevel
+
+via /etc/default/grub + update-grub, and the test re-run. Capture was verified
+first with `echo MARKER > /dev/kmsg`.
+
+SECOND AND THIRD ATTEMPTS, both captured, both identical:
+
+    [  254.436698] Kernel panic - not syncing: Pool 'ziltest' has encountered
+                   an uncorrectable I/O failure and the failure mode property
+                   for this pool is set to panic.
+    [  254.436905] CPU: 1 UID: 0 PID: 1380 Comm: z_rd_iss Tainted: P OE
+                   6.12.95+deb13-cloud-arm64 #1 Debian 6.12.95-1
+    [  254.437015] Hardware name: Apple Inc. Apple Virtualization Generic Platform
+    [  254.437061] Call trace:
+    [  254.437081]  dump_backtrace+0xd8/0x130
+    [  254.437114]  show_stack+0x20/0x38
+    [  254.437145]  dump_stack_lvl+0x60/0x80
+    [  254.437181]  dump_stack+0x18/0x28
+    [  254.437216]  panic+0x164/0x378
+    [  254.437251]  zio_suspend+0x1b0/0x1b8       [zfs]     <-- zio.c:2668
+    [  254.437451]  zio_done+0xe84/0x1130         [zfs]
+    [  254.437618]  zio_execute+0xc0/0x170        [zfs]
+    [  254.437771]  vdev_mirror_io_start+0x11c/0x280 [zfs]
+    [  254.437930]  zio_vdev_io_start+0x2ac/0x348 [zfs]
+    [  254.438097]  zio_execute+0xc0/0x170        [zfs]
+    [  254.438262]  taskq_thread+0x300/0x650      [spl]
+    [  254.438356]  kthread+0xe8/0xf8
+    [  254.438407]  ret_from_fork+0x10/0x20
+    [  254.438456] SMP: stopping secondary CPUs
+    [  254.476899] ---[ end Kernel panic ... ]---
+
+Timing was reproducible to within 0.1 s across both runs: first uncorrectable
+zio error at T, panic at T+10.2 s (run 2) and T+10.3 s (run 3).
+
+**zio_suspend() IS CONFIRMED AS THE DISPOSITION OF THIS ZIO.** That is the
+function that panics under failmode=panic and that blocks forever under
+failmode=wait. Taken with experiment 1, the mechanism of the hang in the test environment is no longer a
+hypothesis.
+
+IMPORTANT SCOPE LIMIT ON 1b, ESTABLISHED BY RE-RUNNING WITH A PERSISTENT LOG.
+The script's own output (written to ~/07-panic2.log rather than tmpfs, which
+does not survive a panic) ends here:
+
+    === 6. yank the log device out from under the live pool ===
+        swap the dm table to an error target: ...
+        provoking ZFS into noticing the failure
+    <end of file>
+
+So the panic fires during the `zpool scrub` provocation in STEP 6, BEFORE
+`zpool remove` is issued in step 7. The panicking ZIO was issued by a z_rd_iss
+taskq thread via vdev_mirror_io_start and CANNOT be attributed to the
+zil_parse() read.
+
+What 1b therefore does and does not show:
+  DOES:     zio_suspend() is where uncorrectable I/O on this pool ends up, and
+            under failmode=panic it panics rather than blocking.
+  DOES NOT: isolate the zil_parse() read. Under failmode=panic the pool dies at
+            the first uncorrectable read, whichever one that is.
+
+This qualifies the operational note in CONCLUSIONS.md section 2, which says that
+had failmode=panic been reachable during the incident, it "would have produced
+a crash dump instead of an unkillable D-state". Still true and still a better
+diagnostic position -- but the crash dump would likely come from the first
+failing read, not necessarily from zil_parse(), and the note should say so.
+
+
+EXPERIMENT 3: DOES SPA_LOG_CLEAR PERSIST? (claim 1.13)
+------------------------------------------------------
+Claim 1.13 asks why spa_ld_verify_logs() did not block on the incident's repair
+import, given that Patch A is now known to be inert on the hole path (claim
+1.12). Verify runs at spa.c:6106, before claim at spa.c:6175, so Patch B cannot
+explain it. The leading candidate was that spa_log_state was still
+SPA_LOG_CLEAR from the `zpool import -m` at 2026-07-19.22:42:44, which would
+make spa_check_logs() return early (claim 3.4).
+
+THAT CANDIDATE IS ELIMINATED, THREE WAYS.
+
+(i) SOURCE: the state is in-memory only.
+
+    /* spa_misc.c:2759 */
+    void
+    spa_set_log_state(spa_t *spa, spa_log_state_t state)
+    {
+            spa->spa_log_state = state;
+    }
+
+    grep -c spa_log_state module/zfs/spa_config.c   -> 0
+    grep -c spa_log_state module/zfs/vdev.c         -> 0
+
+    It is a field on the in-core spa_t and is never serialised into the config
+    nvlist or the vdev labels. The spa_t is destroyed on export.
+
+(ii) SOURCE: it is recomputed per-import from a per-ioctl flag.
+
+    spa_check_for_missing_logs() (spa.c:2772), called from spa_load_impl() at
+    spa.c:5095, tests `spa->spa_import_flags & ZFS_IMPORT_MISSING_LOG`
+    (spa.c:2781) -- i.e. whether -m was passed on THIS import. Only then does
+    it reach the loop that sets SPA_LOG_CLEAR:
+
+        for (uint64_t c = 0; c < rvd->vdev_children; c++) {
+                vdev_t *tvd = rvd->vdev_child[c];
+                if (tvd->vdev_islog &&
+                    tvd->vdev_state == VDEV_STATE_CANT_OPEN) {
+                        spa_set_log_state(spa, SPA_LOG_CLEAR);       /* :2827 */
+                        spa_load_note(spa, "some log devices are "
+                            "missing, ZIL is dropped.");
+                        break;
+                }
+        }
+
+    Without -m it takes the other branch and returns ENXIO -- the "refused
+    outright" behaviour already recorded as finding 12.
+
+(iii) EXPERIMENT, on this VM:
+
+    A. pool with a live ZIL, ds1 unmounted, exported, log backing file deleted;
+       plain `zpool import`:
+         cannot import 'ziltest': one or more devices is currently unavailable
+         The devices below are missing or corrupted, use '-m' to import ...
+             /var/tmp/ziltest/slog [log]
+
+    B. `zpool import -m`:  succeeds, pool imported. Then exported.
+
+    C. plain `zpool import` AGAIN, after the -m import and export:
+         cannot import 'ziltest': one or more devices is currently unavailable
+         The devices below are missing or corrupted, use '-m' to import ...
+             /var/tmp/ziltest/slog [log]
+
+    C is byte-identical to A. The -m import left nothing behind.
+
+AND A FOURTH REASON, SPECIFIC TO THE INCIDENT. Even if the state had persisted,
+it would not have been set for that pool: by the time of the repair import the
+log was a HOLE, not a missing log vdev. Holes have vdev_islog = 0 and open
+HEALTHY (vdev.c:2248), so `tvd->vdev_islog && tvd->vdev_state ==
+VDEV_STATE_CANT_OPEN` at spa.c:2825-2826 is false for them. The loop above
+would never have fired.
+
+CLAIM 1.13 REMAINS UNKNOWN, but its leading candidate is now closed. The
+surviving candidate is that the dangling header had already been cleared before
+the repair import -- claim 4.10 rules that out only for the `-N` repair import
+itself, not for the earlier writable import under the NOP'd module, during
+which datasets were mounted and usable.
+
+
+SUMMARY: THE THREE-WAY failmode RESULT ON 2.4.3
+------------------------------------------------
+| failmode | outcome of 07-path-h-yank-live-log.sh                          |
+|----------|----------------------------------------------------------------|
+| wait     | `zpool remove` hangs unkillably in zil_parse -> arc_read ->     |
+| (default)| zio_wait. spa_namespace_lock held, `zpool list` exits 124,       |
+|          | forced power cycle required. (2026-07-31-zfs-2.4.3-test-results) |
+| continue | NO HANG. remove exit=0, hole created, all headers cleared,       |
+|          | script runs to completion.                                       |
+| panic    | Kernel panic at zio_suspend(), during the step-6 scrub           |
+|          | provocation, before the removal is issued.                       |
+
+All three are consistent with one mechanism, and it is now established rather
+than hypothesised: **the ZIO's disposition is zio_suspend(), and under the
+default failmode=wait that call never returns.** CLAIMS.md 2.6 can move from
+UNKNOWN to established FOR THE REMOVAL CASE IN THE TEST ENVIRONMENT.
+
+
+WHAT THIS DOES NOT EXPLAIN
+--------------------------
+**The incident's import-time hang is a different situation and remains
+unexplained.** The suspend that explains the hang in the test environment requires
+spa_load_state == SPA_LOAD_NONE (zio.c:5718). During an import the load state
+is SPA_LOAD_IMPORT, so that suspend cannot fire; and zil_read_log_block()
+passes ZIO_FLAG_CANFAIL (zil.c:251), which disarms the catch-all suspend at
+zio.c:5722-5724. By that reading the incident's read should have returned ENXIO
+to zil_parse(), taken its existing error path, and produced a clean import
+failure.
+
+It hung instead. That is CLAIMS.md 4.9 and it is untouched by these three
+experiments -- if anything it is sharpened, because the hang in the test environment now has a
+complete explanation that demonstrably CANNOT apply to the incident.
+
+The two hangs share a blocking site (claim 2.4) but, on this evidence, not a
+mechanism. Any bug report should say so rather than presenting the test-environment
+reproducer as a model of the incident.
+
+Open, and now the single best next test: synthesise the precondition
+artificially -- a non-zero zh_log whose DVA resolves to a hole vdev -- and
+import an unpatched 2.4.3. If it hangs, the incident mechanism is in the test environment
+for the first time. If it fails cleanly with VDEV_AUX_BAD_LOG, then 4.9's
+source reading is right and the incident hang had some further cause.

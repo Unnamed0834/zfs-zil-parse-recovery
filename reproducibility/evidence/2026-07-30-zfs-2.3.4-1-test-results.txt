@@ -1,0 +1,104 @@
+ZFS 2.3.4 Test Results on Debian 13 (Trixie)
+================================================
+
+CORRECTION, 2026-07-31: THERE IS NO 2.4.1 RESULT FOR TEST 06.
+-------------------------------------------------------------
+This file states, in the Summary line, in the "Result:" line of tests 03, 04
+and 06, and in the Key Finding, that ZFS 2.3.4 behaves the same as "2.2.2 and
+2.4.1". For test 06 (06-path-g-vs-alloc-zero.sh) that comparison is
+UNSUPPORTED and is withdrawn.
+
+06-path-g-vs-alloc-zero.sh was never run on ZFS 2.4.1. There is no row for it
+on 2.4.1 anywhere in ../ATTEMPTS.md; the script was run on 2.2.2 (finding 9),
+on 2.3.4 (this file) and on 2.4.3 (finding 14) only. The "(same as 2.2.2 and
+2.4.1)" on the Test 06 result line below should read "(same as 2.2.2)". The
+same withdrawal applies to the Summary line ("all tests"), to the Key Finding
+("NO DIFFERENCE from 2.2.2 and 2.4.1 on any test path"), and to the sentence
+about "all three ZFS versions tested" -- for test 06 only two versions were
+tested at the time this file was written.
+
+Test 07 likewise has no 2.4.1 result, but this file does not claim one: 07 was
+run later and is recorded in 2026-07-30-zil_parse-removal-hang-2.3.4.txt.
+
+So of the five tests, THREE have a valid 2.4.1 comparison (01, 03, 04) and TWO
+do not (06, 07). ../FINDINGS.md finding 13 previously said "four ... the fifth
+(07)"; that is corrected there too.
+
+The original result lines below are left EXACTLY as captured. Read them
+through this note. Nothing about the 2.3.4 results themselves is affected --
+only the claim that 2.4.1 was compared against.
+
+A second, smaller caveat on the same row: ../ATTEMPTS.md records the 2.2.2 run
+of 06 as PARTIAL, not RULED OUT. The gate was confirmed and no dangling header
+was produced, but reaching the vs_alloc==0 state required an import -m, which
+clears headers by another route (finding 8).
+
+------------------------------------------------------------------------------
+
+NOTE ON VERSION: this VM built the zfs-2.3.4 RELEASE TAG from source. That is
+NOT the build the incident ran. The incident's module reported itself as
+zfs-2.3.3-107-gec5aa9bfd (a snapshot 107 commits past the zfs-2.3.3 tag).
+Earlier text in this repository described this VM as running "the incident's
+exact ZFS version"; that was wrong and has been corrected. See
+../../incident/evidence/2026-07-30-post-repair-history.txt.
+
+PROVENANCE, verified 2026-07-31 by re-querying the VM: the loaded module
+embeds the git revision zfs-2.3.4-0-g34f96a1 -- zero commits past the tag, at
+commit 34f96a1 -- with ZFS_META_VERSION 2.3.4 and ZFS_META_RELEASE 1. A clean
+release-tag build, no local patches. Check it yourself with:
+  sudo xz -dc /lib/modules/$(uname -r)/extra/zfs.ko.xz | strings | grep '^zfs-2.3'
+
+Date: 2026-07-30
+Host: Apple Silicon (arm64), macOS 26.5.2, Lima 2.2.0 (vz)
+Guest: Debian 13.6 (Trixie), kernel 6.12.95+deb13-cloud-arm64, aarch64
+ZFS: built from source, tag zfs-2.3.4
+
+Summary: ZFS 2.3.4 behaves IDENTICALLY to ZFS 2.2.2 and 2.4.1 on all tests below.
+
+Test 01: verify-environment.sh
+-------------------------------
+Result: PASS (all checks)
+- Finding 2: zpool freeze available on stock build
+- Finding 3: removing log vdev creates hole (is_hole: 1)
+- Pool stays importable after clean removal
+
+Test 03: path-c-failed-log.sh (Finding 5)
+------------------------------------------
+Result: RULED OUT (same as 2.2.2 and 2.4.1)
+- Pool with log vdev, sync writes, 100% I/O errors injected on log
+- Removal succeeded (exit=0) despite failing log
+- Hole created (is_hole: 1)
+- ALL zh_log headers were cleared (no ZIL header: lines)
+- Conclusion: spa_reset_logs() clears headers even against failed log
+
+Test 04: path-d-unopenable-dataset.sh (Finding 6)
+--------------------------------------------------
+Result: RULED OUT (same as 2.2.2 and 2.4.1)
+- Pool with encrypted dataset (key unloaded)
+- Removal REFUSED: "cannot remove: Mount encrypted datasets to replay logs"
+- No hole created
+- All ZIL headers still present
+- Conclusion: encrypted dataset guard works the same
+
+Test 06: path-g-vs-alloc-zero.sh (Finding 9)
+---------------------------------------------
+Result: RULED OUT (same as 2.2.2 and 2.4.1)
+- Pool with log vdev, sync writes, unmount ds1, wipe log
+- import -m succeeded (log UNAVAIL, vs_alloc=0)
+- Removal succeeded (exit=0), hole created (is_hole: 1)
+- ALL zh_log headers were cleared
+- Conclusion: vs_alloc==0 gate works the same, headers still cleared
+
+Key Finding
+-----------
+ZFS 2.3.4 shows NO DIFFERENCE from 2.2.2 and 2.4.1 on any test path.
+
+The precondition remains unreachable by any documented operation on all three
+ZFS versions tested: 2.2.2, 2.3.4, and 2.4.1. Because behaviour is stable
+across that range, a version-specific explanation is less likely. This says
+nothing about TrueNAS's own build, which was never tested.
+
+Next Step
+---------
+Run test 07 (finding 10) to reproduce the unkillable hang on 2.3.4-1.
+This will confirm the zil_parse() gap is present in 2.3.4 as well.

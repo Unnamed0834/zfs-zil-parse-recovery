@@ -1,0 +1,103 @@
+LAB TEST APPARATUS -- NOT A PATCH CANDIDATE. DO NOT SUBMIT THIS ANYWHERE.
+=========================================================================
+
+What this is
+------------
+A debug hook added to a local build of zfs-2.4.3 (commit 83020cf) on VM
+`zfs243`, used once, on 2026-07-31, to manufacture the incident's precondition
+so that it could be tested. See `../FINDINGS.md` finding 16 and
+`../evidence/2026-07-31-precondition-synthesis.txt`.
+
+It adds a module parameter that forces `spa_vdev_remove_log()` to skip
+`spa_reset_logs()`, which is exactly the behaviour the `vs_alloc == 0` gate
+produces naturally and which `../../CLAIMS.md` 4.1 infers stranded the
+incident's ZIL header. With the hook engaged, a `zpool remove` of a healthy log
+leaves every dataset's `zh_log` intact and dangling into the newly created
+hole -- the precondition, in one step.
+
+**It exists to create a broken pool on purpose.** It is not a fix, not a
+proposal, and not related to Patch E, which changes the same gate for the
+opposite reason (E makes the reset *always* run; this makes it *never* run).
+
+Why it was needed
+-----------------
+Nine hypotheses across four ZFS versions failed to reach the precondition by
+any natural route. (Ten, per the 2026-07-31 restoration of hypothesis E to the
+enumeration; see ../FINDINGS.md finding 12.) But reproducing *causation* and testing what the state
+*does* are different problems, and the second only needs the state, by any
+means. Everything in finding 16 -- including the discovery that the state does
+**not** hang a writable import on 2.4.3 -- depends on this hook.
+
+Known defect in the diff below
+------------------------------
+The insertion was scripted and it accidentally dropped `static` from the
+adjacent, pre-existing `zfs_removal_ignore_errors`:
+
+    -static int zfs_removal_ignore_errors = 0;
+    +static int zfs_lab_skip_reset_logs = 0;
+    +int zfs_removal_ignore_errors = 0;
+
+That is unintended and unrelated to the hook. It is harmless for the test --
+the variable is still file-local in practice and its value was never changed --
+but it means the build used was not a clean `zfs-2.4.3` plus one hunk. Recorded
+rather than quietly fixed, because the builds used for finding 16 carried it.
+
+The stock module used for every *measurement* in finding 16 was not this build.
+A pristine `zfs.ko.xz` was backed up before any patching and restored before
+the import tests, and the absence of the parameter was verified each time:
+
+    ls /sys/module/zfs/parameters/ | grep -c lab_skip_reset_logs   # expect 0
+
+How it was used
+---------------
+    # build and install the hooked module, then:
+    echo 1 > /sys/module/zfs/parameters/zfs_lab_skip_reset_logs
+    zpool remove ziltest /var/tmp/ziltest/slog
+    echo 0 > /sys/module/zfs/parameters/zfs_lab_skip_reset_logs
+    zpool export ziltest
+    # restore the pristine stock module before measuring anything
+
+Verify the resulting state at DVA level, not just header presence -- `zdb -i`
+alone only shows that `zh_log` is non-zero (`../../CLAIMS.md` 3.15), not which
+vdev the DVA names. Verbosity 5 is required:
+
+    zdb -e -p /var/tmp/ziltest -C ziltest   | grep -E 'hole_array|is_hole'
+    zdb -e -p /var/tmp/ziltest -iiiii ziltest | grep -E 'ZIL header|DVA\[0\]'
+
+Expect `hole_array[0]: 2` and `DVA[0]=<2:...>` -- vdev index 2 being the hole.
+
+
+THE DIFF
+--------
+
+diff --git a/module/zfs/vdev_removal.c b/module/zfs/vdev_removal.c
+index e222f3f..eaf9296 100644
+--- a/module/zfs/vdev_removal.c
++++ b/module/zfs/vdev_removal.c
+@@ -149,7 +149,8 @@ uint_t zfs_remove_max_segment = SPA_MAXBLOCKSIZE;
+  * not be cancelled.  This can result in a normally recoverable block
+  * becoming permanently damaged and is not recommended.
+  */
+-static int zfs_removal_ignore_errors = 0;
++static int zfs_lab_skip_reset_logs = 0;
++int zfs_removal_ignore_errors = 0;
+ 
+ /*
+  * Allow a remap segment to span free chunks of at most this size. The main
+@@ -2141,7 +2142,8 @@ spa_vdev_remove_log(vdev_t *vd, uint64_t *txg)
+ 	 * should no longer have any blocks allocated on it.
+ 	 */
+ 	ASSERT(spa_namespace_held());
+-	if (vd->vdev_stat.vs_alloc != 0)
++	/* LAB DEBUG HOOK -- not upstream. Models CLAIMS.md 4.1 (vs_alloc==0). */
++	if (vd->vdev_stat.vs_alloc != 0 && !zfs_lab_skip_reset_logs)
+ 		error = spa_reset_logs(spa);
+ 
+ 	*txg = spa_vdev_config_enter(spa);
+@@ -2614,3 +2616,6 @@ EXPORT_SYMBOL(spa_vdev_remove);
+ EXPORT_SYMBOL(spa_vdev_remove_cancel);
+ EXPORT_SYMBOL(spa_vdev_remove_suspend);
+ EXPORT_SYMBOL(svr_sync);
++
++ZFS_MODULE_PARAM(zfs, zfs_, lab_skip_reset_logs, INT, ZMOD_RW,
++	"LAB ONLY: skip spa_reset_logs() during log vdev removal");

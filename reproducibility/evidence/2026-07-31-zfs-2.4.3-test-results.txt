@@ -1,0 +1,260 @@
+ZFS 2.4.3 test run: closing the version-coverage gap
+=====================================================
+
+Date:  2026-07-31
+Host:  Apple Silicon (arm64), macOS 26.6, Lima 2.2.0 (vz)
+Guest: Debian 13 (Trixie), kernel 6.12.95+deb13-cloud-arm64, aarch64
+VM:    zfs243
+ZFS:   built from source, tag zfs-2.4.3
+
+
+WHY THIS RUN EXISTS
+-------------------
+Every previous result in this repository was produced on ZFS 2.2.2, the
+zfs-2.3.4 release tag, or 2.4.1. On 2026-07-31 it was found that **none of
+those three trees contains amotin's 1e1d64d** ("Fix log vdev removal issues",
+2026-03-04, closes openzfs/zfs#18277). That commit first ships in zfs-2.4.3.
+
+Two consequences, both recorded as ../../CLAIMS.md 3.29:
+
+  (a) The "2.4.x is already hardened by 1e1d64d" hypothesis behind FINDINGS.md
+      finding 13 was never actually tested. All three trees compared lack the
+      hardening, so their agreeing with one another proved nothing about it.
+
+  (b) zfs-2.4.3 is also the tree the incident repair was built on
+      (module string: zfs-2.4.3-0-g83020cf-dirty-dist). So the fix ran with
+      1e1d64d plus Patches A-D on top, while the testing ran without 1e1d64d
+      at all.
+
+This run closes (a) and (b).
+
+IT DOES NOT TEST WHETHER 1e1d64d WOULD HAVE PREVENTED THE INCIDENT. It would
+not. 1e1d64d tests BP_IS_HOLE(&zh->zh_log) -- an ALL-ZERO DVA. The incident
+pool held a VALID, NON-ZERO DVA whose vdev index resolved to a hole, which
+that test does not match (CLAIMS.md 3.5, 3.2). The affected machine was a
+fresh, fully-updated install of the then-current TrueNAS release and hung
+anyway. The gap in zil_check_log_chain() is independent of this.
+
+
+PROVENANCE OF THE BUILD
+-----------------------
+  $ git clone --depth 1 --branch zfs-2.4.3 https://github.com/openzfs/zfs.git
+  $ git log -1 --format="%H %d"
+  83020cf8259d057d4cc9102010c05f07ffdfc136  (grafted, HEAD, tag: zfs-2.4.3)
+
+  $ ./autogen.sh && ./configure --prefix=/usr && make -j4 && sudo make install
+  $ sudo ldconfig && sudo depmod -a && sudo modprobe zfs
+
+  $ cat /sys/module/zfs/version
+  2.4.3-1
+  $ zfs version
+  zfs-2.4.3-1
+  zfs-kmod-2.4.3-1
+
+  $ sudo xz -dc /lib/modules/6.12.95+deb13-cloud-arm64/extra/zfs.ko.xz \
+      | strings | grep '^zfs-2\.4'
+  zfs-2.4.3-0-g83020cf
+
+Zero commits past the tag. Clean release-tag build, no local patches. This is
+commit 83020cf -- the same commit the incident repair environment reported
+(zfs-2.4.3-0-g83020cf-dirty-dist), minus the "-dirty" local edits.
+
+1e1d64d IS PRESENT in this tree, confirmed three ways:
+
+  $ grep -n "If the log is empty, then there is nothing to do here" module/zfs/zil.c
+  1171:	 * If the log is empty, then there is nothing to do here.
+
+  $ grep -c "memset(zh, 0, sizeof (zil_header_t))" module/zfs/zil.c
+  2                        # 1 in every earlier release; 1e1d64d adds the second
+
+  $ grep -c "ASSERT0(vd->vdev_stat.vs_alloc)" module/zfs/vdev_removal.c
+  1                        # zfs-2.4.2 has 2; 1e1d64d deletes the first
+
+The guard under test is unchanged by 1e1d64d, as claim 3.1 says:
+
+  $ sed -n "1294,1302p" module/zfs/zil.c
+		spa_config_enter(os->os_spa, SCL_STATE, FTAG, RW_READER);
+		vd = vdev_lookup_top(os->os_spa, DVA_GET_VDEV(&bp->blk_dva[0]));
+		if (vd->vdev_islog && vdev_is_dead(vd))
+			valid = vdev_log_state_valid(vd);
+		spa_config_exit(os->os_spa, SCL_STATE, FTAG);
+
+		if (!valid)
+			return (0);
+
+and so is the vs_alloc gate behind Patch E (claim 3.8):
+
+  $ sed -n "2143,2146p" module/zfs/vdev_removal.c
+	ASSERT(spa_namespace_held());
+	if (vd->vdev_stat.vs_alloc != 0)
+		error = spa_reset_logs(spa);
+
+
+RESULTS
+-------
+| Script                        | Finding | Result on 2.4.3            | Same as 2.2.2/2.3.4? |
+|-------------------------------|---------|----------------------------|----------------------|
+| 01-verify-environment.sh      | 2, 3    | PASS, all 6 checks         | Yes                  |
+| 03-path-c-failed-log.sh       | 5       | RULED OUT                  | Yes                  |
+| 04-path-d-unopenable-dataset  | 6       | RULED OUT (refused)        | Yes                  |
+| 06-path-g-vs-alloc-zero.sh    | 9       | RULED OUT (gate confirmed) | Yes                  |
+| 07-path-h-yank-live-log.sh    | 10      | HUNG, stack captured       | Yes, with one
+                                                                          difference -- see below |
+
+01: log vdev created, `zpool freeze` accepted on this build, clean removal
+    produced hole_array[0]: 2 / vdev_children: 3 / is_hole: 1, and the pool
+    remained importable read-write afterwards.
+
+03: zinject 100% I/O errors on the log, then remove. remove exit=0, hole
+    created, "errors: 170 data errors" reported, and every zh_log cleared
+    (no "ZIL header:" line for mos, ziltest, or ziltest/ds1).
+    Identical to 2.2.2 (170 errors) and 2.3.4 (170 errors).
+
+04: encrypted dataset with key unloaded, then remove.
+      cannot remove /var/tmp/ziltest/slog: Mount encrypted datasets to replay logs.
+      remove exit=1
+    No hole created; the vdev tree still shows three 'file' children. The
+    replay guard is present and behaves identically.
+
+06: wipe the log, import -m, remove.
+      14845487527363708531   512M      0   480M  ...  UNAVAIL     <- vs_alloc 0
+      remove exit=0
+    Hole created (hole_array[0]: 2, is_hole: 1), reset skipped, and every
+    zh_log cleared -- because reaching vs_alloc == 0 required the import -m,
+    which clears headers via SPA_LOG_CLEAR. Gate confirmed, no stranded
+    header. Exactly the 2.2.2 and 2.3.4 outcome.
+
+
+07: THE HANG, REPRODUCED ON 2.4.3 WITH A VERIFIED STACK
+-------------------------------------------------------
+This is the first stack capture for this hang on any version other than 2.2.2.
+The 2.3.4 run was a 120-second timeout with no stack (see the 2026-07-30 file).
+
+Sequence: log backed by file -> loop -> dm-linear; sync writes to build a live
+ZIL chain; `zfs unmount ziltest/ds1` so its header cannot drain; dm table
+swapped to an `error` target with the pool still imported.
+
+  vs_alloc before yank: 40.4M on the pool, log ALLOC non-zero
+  vs_alloc after yank:  72K   (NON-zero, so spa_reset_logs() runs)
+  log vdev state:       FAULTED, "too many errors"
+  pool state:           DEGRADED
+
+  $ sudo tr '\0' ' ' < /proc/60246/cmdline
+  zpool remove ziltest slogdev
+
+  $ sudo cat /proc/60246/stack
+  [<0>] __cv_timedwait_common+0xe4/0x288 [spl]
+  [<0>] __cv_timedwait_io+0x20/0x38     [spl]
+  [<0>] zio_wait+0x14c/0x358            [zfs]
+  [<0>] arc_read+0xd78/0x1640           [zfs]
+  [<0>] zil_parse+0x1f0/0x6e8           [zfs]
+  [<0>] zil_destroy+0x210/0x280         [zfs]
+  [<0>] zil_suspend+0x520/0x680         [zfs]
+  [<0>] zil_reset+0x20/0xb0             [zfs]
+  [<0>] dmu_objset_find_impl+0x108/0x350 [zfs]
+  [<0>] dmu_objset_find_impl+0x1c0/0x350 [zfs]
+  [<0>] dmu_objset_find+0x80/0xd8       [zfs]
+  [<0>] spa_reset_logs+0x34/0x80        [zfs]
+  [<0>] spa_vdev_remove+0x6d4/0x958     [zfs]
+  [<0>] zfs_ioc_vdev_remove+0x6c/0xc8   [zfs]
+  [<0>] zfsdev_ioctl_common+0x850/0x900 [zfs]
+  [<0>] zfsdev_ioctl+0x70/0x108         [zfs]
+  [<0>] __arm64_sys_ioctl+0xbc/0x100
+  [<0>] invoke_syscall+0x60/0xe0
+  [<0>] el0_svc_common.constprop.0+0xc8/0xf0
+  [<0>] do_el0_svc+0x24/0x38
+  [<0>] el0_svc+0x38/0x148
+  [<0>] el0t_64_sync_handler+0xc8/0xe0
+  [<0>] el0t_64_sync+0x190/0x198
+
+Same blocking site as 2.2.2: zil_parse -> arc_read -> zio_wait, reached
+through spa_reset_logs -> zil_reset -> zil_suspend -> zil_destroy.
+
+Two frames present on 2.2.2 are absent here -- zil_read_log_block (between
+zil_parse and arc_read) and zil_destroy_sync (between zil_destroy and
+zil_parse), as is spa_vdev_remove_log (between spa_vdev_remove and
+spa_reset_logs). These are inlined at this build's optimisation level, not
+missing code paths. The call chain is the same.
+
+The kernel's own hung-task watchdog confirms it independently:
+
+  [  846.792706] INFO: task zpool:60246 blocked for more than 120 seconds.
+  [  846.792716]       Tainted: P           OE      6.12.95+deb13-cloud-arm64
+  [  846.792724] task:zpool  state:D  stack:0  pid:60246 tgid:60246 ppid:60245
+  [  846.792750]  __cv_timedwait_common+0xe4/0x288 [spl]
+  [  846.792801]  zio_wait+0x14c/0x358 [zfs]
+  [  846.793021]  arc_read+0xd78/0x1640 [zfs]
+  [  846.793106]  zil_parse+0x1f0/0x6e8 [zfs]
+  [  846.793205]  zil_destroy+0x210/0x280 [zfs]
+  [  846.793281]  zil_suspend+0x520/0x680 [zfs]
+  [  846.793424]  dmu_objset_find_impl+0x108/0x350 [zfs]
+  [  846.793635]  spa_reset_logs+0x34/0x80 [zfs]
+  [  846.793700]  spa_vdev_remove+0x6d4/0x958 [zfs]
+
+The script wraps the removal in `timeout 120`. That expired without effect:
+the task is in uninterruptible sleep, so the timeout kills nothing. The
+process was still in D-state 165 seconds after launch.
+
+  $ timeout 20 zpool list ; echo "exit=$?"
+  exit=124
+
+spa_namespace_lock is still held, so every subsequent zpool command blocks.
+Recovery required `limactl stop --force zfs243`.
+
+
+ONE GENUINE DIFFERENCE FROM 2.2.2: txg_quiesce IS NOT WEDGED
+-------------------------------------------------------------
+On 2.2.2 the capture showed two D-state tasks:
+
+  10466 D    txg_quiesce
+  10725 D    zpool
+
+On 2.4.3 there is only one:
+
+  60246 D    zpool
+
+and `dmesg | grep -c txg_quiesce` returns 0 -- the txg_quiesce thread never
+blocked and never tripped the hung-task watchdog.
+
+This is the first behavioural difference between versions found anywhere in
+this reproduction work, and it should be reported accurately:
+
+  - CLAIMS.md 2.2 ("the hang also wedges txg_quiesce, stalling the entire
+    pool") is REPRODUCED on 2.2.2 and NOT REPRODUCED on 2.4.3.
+  - CLAIMS.md 2.1 (the hang itself) and 2.3 (unkillable, holds
+    spa_namespace_lock, needs a power cycle) are reproduced on BOTH.
+
+The practical outcome is unchanged -- the machine still needs a forced power
+cycle, and every zpool command still blocks -- but the blast radius is
+narrower on 2.4.3 than the 2.2.2 capture suggests. A bug report should not
+claim the whole pool stalls on current releases without saying which version
+that was seen on.
+
+Whether this is a deliberate improvement or an artifact of timing (the run was
+observed for ~165 s; txg_quiesce might block later under sustained write load)
+was NOT determined. Treat it as observed-not-explained.
+
+
+WHAT THIS RUN ESTABLISHES
+-------------------------
+- The precondition remains unreachable by routes C, D and G on zfs-2.4.3,
+  the only release containing 1e1d64d. Claim 3.20's bounded negative now
+  spans four releases instead of three, including the hardened one.
+- CLAIMS.md 4.5 can move from UNTESTED to DISPROVED: 2.4.3 is NOT hardened
+  against these paths relative to 2.3.4. It behaves identically.
+- The finding-10 hang survives into 2.4.3, WITH a captured stack. The newest
+  release is no longer the untested one for this defect. Reporting the hang
+  no longer needs the caveat "newest version tested is 2.3.4".
+- The two sides of this repository now share a tree: the reproduction has
+  been run on the same commit (83020cf) the incident repair was built from.
+
+WHAT IT DOES NOT ESTABLISH
+--------------------------
+- Anything about failmode. This run used the default failmode=wait, like
+  every other run in ATTEMPTS.md. FAILMODE=continue is still untested on
+  every version. See CLAIMS.md 2.6 and 4.9.
+- Anything about routes A/F (script 05), the freeze route, or the offline
+  route on 2.4.3. Only 01, 03, 04, 06 and 07 were run here.
+- Anything about TrueNAS's own build, middleware, or x86-64.
+- Whether the corrected form of Patch A works. Nothing was patched in this
+  VM; it is a clean release-tag build. See CLAIMS.md 1.12.

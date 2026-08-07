@@ -1,0 +1,36 @@
+cff-version: 1.2.0
+message: "If you reference this analysis, please cite it as below."
+title: "ZFS SLOG hole-vdev recovery: a case study, a reproducible OpenZFS hang, and the patches that repaired one pool"
+abstract: >-
+  A case study of recovering a 186 TB raw (140 TB allocated) OpenZFS pool that
+  a failed mirrored SLOG left unimportable through two independent on-disk
+  defects. The first was a ZIL header DVA referencing a removed log vdev that
+  the pool had retained as a hole, and every writable import hung on it. The
+  second was space-map corruption, which tripped a hard assertion in
+  space_map_load_callback. Both defects were repaired on disk, and a completed
+  scrub verified the result. Accompanying reproduction work reproduces an
+  unkillable hang from scratch on stock OpenZFS when a failing log device is
+  removed, in which a read issued from zil_parse() never completes and the
+  thread waits forever in zio_wait(). For that removal case the non-completion
+  traces to zio_suspend() under the default failmode=wait. For the incident's
+  import path it remains an open question: synthesising the
+  hole-plus-dangling-DVA state on zfs-2.4.3 did not hang. How the incident pool
+  reached its precondition proved unreproducible by any natural route across
+  ten hypotheses and four ZFS versions, and it is classified as an anomaly of
+  the hardware failure.
+authors:
+  - alias: Unnamed0834
+date-released: 2026-08-04
+license: CC-BY-4.0
+repository-code: "https://github.com/Unnamed0834/zfs-zil-parse-recovery"
+keywords:
+  - ZFS
+  - zil_parse
+  - vdev removal
+  - reproducibility
+  - OpenZFS
+  - SLOG
+  - ZIL
+  - metaslab
+  - space map
+  - data recovery
