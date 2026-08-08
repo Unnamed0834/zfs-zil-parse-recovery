@@ -1,0 +1,329 @@
+Synthesising the precondition, and what a stock 2.4.3 import actually does with it
+==================================================================================
+
+Date:  2026-07-31
+Host:  Apple Silicon (arm64), macOS 26.6, Lima 2.2.0 (vz)
+Guest: Debian 13 (Trixie), kernel 6.12.95+deb13-cloud-arm64, aarch64
+VM:    zfs243
+ZFS:   source build, tag zfs-2.4.3, commit 83020cf (the incident's repair tree)
+
+**READ THE "WHAT THIS MEANS" SECTION BEFORE CITING ANY OF THIS.** This file
+contains the most consequential negative result in the repository.
+
+
+CORRECTION, 2026-07-31 (later the same day): TWO SECTIONS BELOW ARE SUPERSEDED
+------------------------------------------------------------------------------
+Read this before the sections named. Nothing in the main result changes -- the
+precondition was synthesised, verified at DVA level, and does not hang an
+unclaimed writable import on zfs-2.4.3. What changes is two subsidiary
+readings, both of which were wrong. Both are settled in
+2026-07-31-claimed-chain-variant.txt (FINDINGS.md finding 17).
+
+1. "AN UNEXPLAINED ARTIFACT, RECORDED SO IT IS NOT MISTAKEN FOR THE INCIDENT"
+   says the cause is "NOT determined" and offers, as "the likely reading",
+   that skipping spa_reset_logs() left the pool inconsistent -- "an artifact of
+   the debug hook, not of the hole".
+
+   THE CAUSE IS NOW DETERMINED AND THE DEBUG HOOK IS NOT IMPLICATED. Capturing
+   the full dbgmsg rather than its tail shows the label messages are downstream
+   of an earlier, real failure:
+
+     1. spa_load_verify() fails EIO on the hole-vdev blkptr
+        (zio.c:1135: "ziltest: blkptr at ... DVA 0 has hole VDEV 2")
+     2. spa_load_retry: rewind, max txg: 50
+     3. the rewind caps the acceptable uberblock at txg 42, below the label's
+        own txg 51
+     4. the label is discarded as "too large (51 > 42)"
+     5. with no usable label, the retry reports "label config unavailable"
+
+   Steps 2-5 are ordinary rewind machinery reacting to step 1.
+
+2. "WHAT COULD NOT BE TESTED, AND WHY IT MATTERS" records the claimed-chain
+   variant as untested, says import #2 "always dies on the label artifact
+   above, before spa_ld_verify_logs() is reached", and calls it "the single
+   most promising open lead".
+
+   ALL THREE ARE WITHDRAWN.
+     - It was not blocked. The claimed state can be produced deliberately
+       (import once to claim, export, archive) and imported at will. It was,
+       three times.
+     - spa_ld_verify_logs() IS reached and does NOT block. Confirmed by ftrace,
+       not inferred: zil_check_log_chain entered 4 times and zil_parse 3 times
+       during the failing import, both returning, with the load proceeding to
+       "Verifying pool data".
+     - It is not a lead. The claimed-chain variant does not hang either. It
+       fails fast with EIO at spa_load_verify(), exit 1, no D-state task -- and
+       it also fails READ-ONLY, which the incident pool did not, so it is not a
+       model of the incident.
+
+   Net effect: the gap between this synthesis and the incident WIDENS. The
+   "CANDIDATE DIFFERENCES" list at the end of this file should be read with
+   "claimed vs unclaimed chain (see above -- the leading candidate)" struck
+   out, and with none of the remaining candidates favoured over any other.
+
+Everything else in this file stands as captured.
+
+
+WHY
+---
+Nine hypotheses across four ZFS versions failed to reach the incident's
+precondition -- a hole vdev together with a dataset whose zh_log DVA resolves
+to that hole -- and it was classified as an anomaly (CLAIMS.md 4.2).
+(Correction, 2026-07-31: ten hypotheses. Hypothesis E, the malformed removal
+call, was restored to the enumeration later the same day; see FINDINGS.md
+finding 12 and ATTEMPTS.md's header.)
+
+That closure conflated two different goals. Reproducing *causation* needs a
+natural route. Testing what the state *does*, and testing a patch against it,
+only needs the state, by any means. This run produces the state artificially.
+
+
+METHOD: A TEST-ONLY DEBUG HOOK, NOT A NATURAL ROUTE
+---------------------------------------------
+CLAIMS.md 4.1 infers that the incident's header was stranded because
+spa_reset_logs() was skipped by the vs_alloc == 0 gate. That inference is
+directly testable by forcing the skip.
+
+module/zfs/vdev_removal.c, spa_vdev_remove_log(), local build only:
+
+    ASSERT(spa_namespace_held());
+    /* LAB DEBUG HOOK -- not upstream. Models CLAIMS.md 4.1 (vs_alloc==0). */
+    if (vd->vdev_stat.vs_alloc != 0 && !zfs_lab_skip_reset_logs)
+            error = spa_reset_logs(spa);
+
+    ZFS_MODULE_PARAM(zfs, zfs_, lab_skip_reset_logs, INT, ZMOD_RW,
+        "LAB ONLY: skip spa_reset_logs() during log vdev removal");
+
+**This hook is not proposed for upstream and is not part of any patch in this
+repository.** It exists to manufacture a state, nothing more.
+
+Sequence:
+  1. pool with two file vdevs plus a top-level log, sync=always
+  2. 20 x 1 MB synchronous writes to ziltest/ds1 -> live ZIL chain on the log
+     (log vs_alloc 22.0M)
+  3. zfs unmount ziltest/ds1, so the header cannot drain
+  4. echo 1 > /sys/module/zfs/parameters/zfs_lab_skip_reset_logs
+  5. zpool remove ziltest <log>          -> exit 0
+  6. echo 0 > ... (hook back off), zpool export
+
+
+RESULT: THE PRECONDITION, SYNTHESISED
+-------------------------------------
+    $ zdb -e -p /var/tmp/ziltest -C ziltest | grep -E 'hole_array|is_hole'
+            hole_array[0]: 2
+                    is_hole: 1
+
+    $ zdb -e -p /var/tmp/ziltest -iiiii ziltest
+    Dataset ziltest/ds1 [ZPL], ID 388, cr_txg 8, 20.1M, 26 objects
+        ZIL header: claim_txg 0, claim_blk_seq 0, claim_lr_seq 0 replay_seq 0, flags 0x0
+        Block seqno 341, won't claim,
+            DVA[0]=<2:15e6000:11000> [L0 ZIL intent log] zilog2 ... birth=11L/11P
+    Dataset ziltest [ZPL], ID 54, cr_txg 1, 24K, 7 objects
+        ZIL header: claim_txg 0, claim_blk_seq 0, claim_lr_seq 0 replay_seq 0, flags 0x0
+        Block seqno 2, won't claim,
+            DVA[0]=<2:1000:1000> [L0 ZIL intent log] zilog2 ... birth=10L/10P
+
+**DVA[0]=<2:...> and hole_array[0]: 2 -- vdev index 2 is the hole, and both
+datasets' ZIL headers point into it.** This is the state the incident pool was
+in. It has never been produced in the test environment before, by any route.
+
+Note this was verified with the DVA printed explicitly. `zdb -i` alone only
+shows that zh_log is non-zero (CLAIMS.md 3.15); verbosity 5 or higher is
+required to see which vdev the DVA names. An earlier version of this test was
+nearly recorded without that check.
+
+SIDE RESULT: CLAIMS.md 4.1'S CAUSATION IS NOW DEMONSTRATED, NOT JUST INFERRED.
+4.1 said "the skip is confirmed; that it strands headers in practice is not."
+It does. Given the skip, the headers survive and dangle into the hole, in one
+step, every time. What remains inferred is only whether the incident actually
+took that route.
+
+
+THE DECISIVE TEST: WHAT DOES A STOCK IMPORT DO WITH IT?
+--------------------------------------------------------
+The hook-patched module was removed and the pristine stock zfs-2.4.3 module
+restored from a backup taken before any patching:
+
+    cp /root/zfs.ko.xz.STOCK-2.4.3 /lib/modules/$(uname -r)/extra/zfs.ko.xz
+    depmod -a && modprobe zfs
+    # hook parameter absent, confirmed
+
+Then, writable import:
+
+    $ zpool import -d /var/tmp/ziltest -o cachefile=none -N ziltest
+    exit=0
+    $ zpool list -H -o name,health
+    ziltest ONLINE
+
+    $ ps -eo pid,stat,comm | awk '$2 ~ /D/'
+    (nothing)
+
+**NO HANG. THE POOL IMPORTED CLEANLY, WRITABLE, IN UNDER A SECOND.**
+
+Repeated from a pristine restore of the same synthesised state: same result,
+exit 0, ONLINE, no D-state process.
+
+dbgmsg for the import shows a clean load with no log complaint at all:
+
+    spa_misc.c:431:spa_load_note(): spa_load(ziltest, config trusted): LOADED
+
+No "spa_check_logs failed", no "dropping the logs", no
+"ZFS read log block error" in dmesg.
+
+After the import the headers show the chain was claimed:
+
+    ZIL header: claim_txg 37, claim_blk_seq 341, claim_lr_seq 0 replay_seq 0, flags 0x2
+    ZIL header: claim_txg 37, claim_blk_seq 2,   claim_lr_seq 0 replay_seq 0, flags 0x2
+
+claim_blk_seq matches the header's own seqno, and zil_parse() sets
+zl_parse_blk_seq = max_blk_seq (zil.c:575) where max_blk_seq is assigned at
+zil.c:512 -- *before* the read at zil.c:518. So this is consistent with the
+block being claimed, the subsequent read failing, and the loop breaking. The
+failure was then absorbed rather than propagated.
+
+
+WHY IT IS ABSORBED, FROM SOURCE
+-------------------------------
+Two mechanisms, both in the path, both making a dangling unclaimed chain a
+tolerated condition rather than a fatal one:
+
+1. zil.c:256-257, in zil_read_log_block():
+
+       if (zilog->zl_header->zh_claim_txg == 0)
+               zio_flags |= ZIO_FLAG_SPECULATIVE | ZIO_FLAG_SCRUB;
+
+   For an UNCLAIMED chain -- exactly our state, claim_txg 0 -- the read is
+   issued speculatively. It is explicitly best-effort.
+
+2. zil.c:1328, the tail of zil_check_log_chain():
+
+       return ((error == ECKSUM || error == ENOENT) ? 0 : error);
+
+   Checksum and not-found errors are swallowed and reported as success.
+
+This is coherent design, not an oversight: an unclaimed ZIL chain whose first
+block cannot be read is indistinguishable from a chain torn by a crash, which
+ZFS is built to tolerate.
+
+AND IT CORRECTS CLAIMS.md 4.9's MECHANISM. 4.9 reasons that a hole-vdev read
+should fail fast because vdev_hole_ops uses vdev_missing_io_start(), which sets
+ENOTSUP. **That is the wrong entry point.** A read by DVA has io_vd == NULL and
+is dispatched to vdev_mirror_ops, not to the hole's own ops. Confirmed twice
+empirically -- vdev_mirror_io_start appears in the failmode=panic call trace,
+and `zdb -R ziltest 2:20000:1000` against the hole asserts inside
+vdev_mirror_io_start() at vdev_mirror.c:616. The real path is:
+
+    vdev_mirror_map_init()      vdev_mirror.c:266
+      - if (!spa_writeable(spa))  :308  -> zfs_dva_valid() filters bad DVAs;
+        if none survive, io_error = ENXIO, return NULL.   <-- READ-ONLY ONLY
+      - writable: this filter is SKIPPED. mc_vd = vdev_lookup_top(...) returns
+        the hole (non-NULL, so the NULL check at :332 does not fire).
+    vdev_mirror_io_start()      :659  c = vdev_mirror_child_select(zio)
+    vdev_mirror_child_select()  :546-551  !vdev_mirror_child_readable(mc)
+        because vdev_readable(hole) is false (vdev_is_dead(hole) is true by
+        design, vdev.c:4754-4756) -> mc_error = ENXIO, mc_skipped = 1
+        -> returns -1
+    back in io_start :660  children = (c >= 0) = 0
+        -> the while loop body never runs; NO child I/O is ever issued
+    vdev_mirror_io_done()       :761-762  good_copies == 0
+        -> zio->io_error = vdev_mirror_worst_error(mm)
+
+4.9's CONCLUSION SURVIVES INTACT and is now empirically confirmed: the read
+fails fast and does not block. Only its cited mechanism was wrong.
+
+A BONUS FINDING falls out of :308: the `!spa_writeable(spa)` branch runs
+zfs_dva_valid() over the DVAs and drops invalid ones. That is a **second,
+independent reason read-only import survives this state**, distinct from the
+spa_writeable() gate on verify/claim recorded as CLAIMS.md 3.3.
+
+
+AN UNEXPLAINED ARTIFACT, RECORDED SO IT IS NOT MISTAKEN FOR THE INCIDENT
+-------------------------------------------------------------------------
+After a successful import and a clean `zpool export` (exit 0), the synthesised
+pool will not import a second time:
+
+    cannot import 'ziltest': I/O error
+            Destroy and re-create the pool from
+            a backup source.
+
+    vdev.c:185: file vdev '.../d1': best uberblock found for spa ziltest, txg=42
+    vdev.c:185: file vdev '.../d1': label discarded as txg is too large (51 > 42)
+    vdev.c:185: file vdev '.../d1': failed to read label config
+    spa_misc.c:417: spa_load_failed(...): FAILED: label config unavailable
+
+Reproduced twice, including from a pristine restore, so it is a property of the
+synthesised state and not of my handling. The label config txg and the best
+uberblock txg disagree.
+
+Cause NOT determined. The likely reading is that skipping spa_reset_logs()
+leaves the pool subtly inconsistent in a way the removal path normally
+prevents -- i.e. an artifact of the debug hook, not of the hole.
+
+**This is NOT the incident's symptom** and must not be presented as it. The
+incident pool imported read-only fine and hung on writable import; this one
+imports writable once and then fails a label check. Different failure, and it
+also blocked the follow-on experiment below.
+
+
+WHAT COULD NOT BE TESTED, AND WHY IT MATTERS
+---------------------------------------------
+The obvious next variant is a CLAIMED chain. Once claim_txg != 0, zil.c:256-257
+no longer sets SPECULATIVE, and zil_parse() emits
+`cmn_err(CE_WARN, "ZFS read log block error %d, dataset %s, seq 0x%llx")` and
+returns the error, which zil_check_log_chain() would propagate unless it is
+ECKSUM/ENOENT. That is a materially different path, and it is plausibly closer
+to the incident, whose pool had been imported before (`zpool import ... -m -N -f`
+at 2026-07-19.22:42:44) and could therefore have carried an already-claimed
+chain.
+
+Import #1 does claim the chain (claim_txg 37, flags 0x2). But import #2 always
+dies on the label artifact above, before spa_ld_verify_logs() is reached. So
+**the claimed-chain case is untested**, and it is now the single most promising
+open lead for CLAIMS.md 4.9.
+
+
+WHAT THIS MEANS
+---------------
+STATED PLAINLY: **a hole vdev plus a dangling non-zero zh_log DVA resolving to
+it is NOT sufficient to hang a writable import on zfs-2.4.3.** Built exactly,
+verified at the DVA level, imported twice from pristine state: no hang, no
+error, pool ONLINE.
+
+That contradicts the mechanism this repository has asserted for defect 1
+throughout -- README, CONCLUSIONS section 1, and recovery-breakdown section 9
+all describe hole + non-zero DVA as the cause of the unkillable import hang.
+On this evidence that description is INCOMPLETE.
+
+WHAT IT DOES NOT OVERTURN:
+  - The incident happened. CLAIMS.md 1.2's SysRq-W stack
+    (spa_ld_verify_logs -> spa_check_logs -> zil_check_log_chain -> zil_parse
+    -> zil_read_log_block -> arc_read -> zio_wait) is OBSERVED and is not in
+    question. Something did hang there.
+  - The guard gap in CLAIMS.md 3.1 is real and source-confirmed. So is the NULL
+    deref in 3.6. Neither depends on this test.
+  - The reproducible removal-side hang (finding 10 / 14) is untouched.
+
+WHAT IT DOES CHANGE:
+  - Any bug report must NOT claim "a ZIL header pointing at a hole vdev hangs
+    your pool on import". Synthesising exactly that does not hang it. The
+    honest statement is: this state was observed to hang one pool on one build,
+    and constructing the state alone on zfs-2.4.3 does not reproduce the hang,
+    so at least one further ingredient is involved and has not been identified.
+  - Patch A's justification weakens further. It was already source-only after
+    CLAIMS.md 1.12; now the condition it guards against has been shown not to
+    hang on a current release. It is still defensible as hardening plus a NULL
+    fix, but not as a fix for a demonstrated hang.
+  - CLAIMS.md 4.9 moves from "sharpest open question" to "partially answered":
+    the read does fail fast, as predicted. The remaining question is narrower
+    and better posed -- what did the incident have that this does not?
+
+CANDIDATE DIFFERENCES between this synthesis and the incident, none tested:
+  claimed vs unclaimed chain (see above -- the leading candidate);
+  the incident's build (zfs-2.3.3-107-gec5aa9bfd, not 2.4.3);
+  140 T of data, many datasets, encrypted datasets, .ix-virt/.system;
+  TrueNAS middleware and concurrent dataset operations;
+  a genuinely failing device underneath rather than a clean hole;
+  the space-map corruption (defect 2) present on the same pool.
+
+That last one deserves emphasis. The incident pool had TWO defects. This
+synthesis reproduces only the first, and in isolation the first is survivable.

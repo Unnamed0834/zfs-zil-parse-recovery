@@ -1,0 +1,320 @@
+Claimed-chain variant of the synthesised precondition: does NOT hang
+=====================================================================
+
+Date:     2026-07-31
+Host:     macOS / Apple Silicon, Lima VM `zfs243`
+Guest:    lima-zfs243, Debian 13, kernel 6.12.95+deb13-cloud-arm64, aarch64
+ZFS:      2.4.3-1, srcversion 17AD2B4A614A69C2867D63B
+          (source build of tag zfs-2.4.3, commit 83020cf)
+Module:   PRISTINE STOCK. md5 of the loaded
+          /lib/modules/6.12.95+deb13-cloud-arm64/extra/zfs.ko.xz is
+          20ca91a6a39fbe1a90cdea39feba95e5, byte-identical to the archived
+          /root/zfs.ko.xz.STOCK-2.4.3. The debug hook
+          (patches/lab-only-skip-reset-logs.txt) was NOT loaded for any import
+          recorded here. It was used only to manufacture the starting state,
+          in the earlier session recorded in
+          2026-07-31-precondition-synthesis.txt.
+
+Relates to: FINDINGS.md finding 17; CLAIMS.md 2.7, 4.9, 1.13.
+Supersedes: the "WHAT COULD NOT BE TESTED, AND WHY IT MATTERS" section of
+          2026-07-31-precondition-synthesis.txt, which recorded this variant
+          as BLOCKED and as "the single most promising open lead".
+
+
+WHAT THIS TESTS
+---------------
+Finding 16 showed that a hole vdev plus a dangling non-zero zh_log DVA
+resolving to it does NOT hang a writable import on zfs-2.4.3. The stated
+reason was that an UNCLAIMED chain is read with ZIO_FLAG_SPECULATIVE
+(zil.c:256-257) and the resulting ECKSUM/ENOENT is swallowed at zil.c:1328.
+
+The obvious follow-up was a CLAIMED chain: once zh_claim_txg != 0 the
+SPECULATIVE flag is not set, so the failure should propagate rather than be
+absorbed. That variant was recorded as untested and as the leading candidate
+for whatever the incident had that the synthesis did not.
+
+It is now tested. It does not hang either.
+
+
+HOW THE CLAIMED STATE WAS PRODUCED
+-----------------------------------
+Starting point: /root/precondition-state.tgz, the finding-16 synthesised
+state, restored to /var/tmp/ziltest. Verified pristine before use:
+
+    # zdb -e -p /var/tmp/ziltest -iiiii ziltest
+    ZIL header: claim_txg 0, claim_blk_seq 0, claim_lr_seq 0 replay_seq 0, flags 0x0
+        Block seqno 341, won't claim, DVA[0]=<2:15e6000:11000> ...
+    ZIL header: claim_txg 0, claim_blk_seq 0, claim_lr_seq 0 replay_seq 0, flags 0x0
+        Block seqno 2, won't claim, DVA[0]=<2:1000:1000> ...
+
+    # zdb -l /var/tmp/ziltest/d1
+        txg: 36
+        state: 1
+        hole_array[0]: 2
+        vdev_children: 3
+
+Import #1 claims the chain, then export:
+
+    # zpool import -d /var/tmp/ziltest -N ziltest
+    import1 exit=0                          <-- no hang, pool ONLINE
+    # zpool export ziltest
+    export exit=0
+
+State after the claim, read back from disk:
+
+    # zdb -e -p /var/tmp/ziltest -iiiii ziltest
+    ZIL header: claim_txg 37, claim_blk_seq 341, claim_lr_seq 0 replay_seq 0, flags 0x2
+        Block seqno 341, already claimed, DVA[0]=<2:15e6000:11000> [L0 ZIL intent log]
+        zilog2 uncompressed unencrypted LE contiguous unique single
+        size=11000L/11000P birth=11L/11P fill=0
+        cksum=12db1422b1c6bc85:523d1971e1fd7b72:0000000000000184:0000000000000155
+
+    ZIL header: claim_txg 37, claim_blk_seq 2, claim_lr_seq 0 replay_seq 0, flags 0x2
+        Block seqno 2, already claimed, DVA[0]=<2:1000:1000> ...
+
+    # zdb -l /var/tmp/ziltest/d1
+        txg: 51
+        state: 1
+        hole_array[0]: 2
+        vdev_children: 3
+
+This is the target state: claim_txg != 0, flags 0x2, chain "already claimed",
+DVA vdev index 2, and vdev 2 is the hole. Archived as
+/root/CLAIMED-CHAIN-state.tgz inside the guest so the test can be repeated
+without re-deriving it.
+
+
+THE TEST: WRITABLE IMPORT OF THE CLAIMED-CHAIN STATE
+-----------------------------------------------------
+
+    # zpool import -d /var/tmp/ziltest -N ziltest
+    cannot import 'ziltest': I/O error
+            Destroy and re-create the pool from
+            a backup source.
+    EXIT=1
+
+    # ps -eo pid,stat,comm | awk '$2 ~ /^D/'
+    (no output -- no task in uninterruptible sleep)
+
+**It fails fast. It does not hang.** Reproduced three times: once in the
+original 2026-07-31 session (recorded then only as an unexplained "label
+artifact"), and twice more here from the archived claimed state.
+
+
+WHERE IT FAILS, FROM DBGMSG
+----------------------------
+Verbatim, /proc/spl/kstat/zfs/dbgmsg, filtered to the load sequence:
+
+    vdev.c:185:vdev_dbgmsg(): file vdev '/var/tmp/ziltest/d1': best uberblock found for spa ziltest, txg=51 seq=0
+    spa_misc.c:431:spa_load_note(): spa_load(ziltest, config untrusted): using uberblock with txg=51
+    spa_misc.c:2485:spa_import_progress_set_notes_impl(): 'ziltest' Verifying Log Devices
+    spa_misc.c:2485:spa_import_progress_set_notes_impl(): 'ziltest' Verifying pool data
+    vdev.c:185:vdev_dbgmsg(): file vdev '/var/tmp/ziltest/d1': best uberblock found for spa ziltest, txg=51 seq=0
+    spa_misc.c:431:spa_load_note(): spa_load(ziltest, config untrusted): using uberblock with txg=51
+    spa_misc.c:2485:spa_import_progress_set_notes_impl(): 'ziltest' Verifying Log Devices
+    spa_misc.c:2485:spa_import_progress_set_notes_impl(): 'ziltest' Verifying pool data
+    zio.c:1102:zfs_blkptr_verify_log(): bad blkptr at ffff800088e8b518: DVA[0]=0x200000008/0x8 DVA[1]=0x0/0x0 DVA[2]=0x0/0x0 prop=0x8009090200070007 prop2=0x0 pad=0x0 phys_birth=0x0 birth=0xa fill=0x0 cksum=0x4b73e406a76ca3a/0xa2e72e57699d04d7/0x36/0x2
+    zio.c:1135:zfs_blkptr_verify_log(): ziltest: blkptr at ffff800088e8b518 DVA 0 has hole VDEV 2
+    spa_misc.c:431:spa_load_note(): spa_load(ziltest, config trusted): spa_load_verify found 1 metadata errors and 0 data errors
+    spa_misc.c:417:spa_load_failed(): spa_load(ziltest, config trusted): FAILED: spa_load_verify failed [error=5]
+    spa_misc.c:431:spa_load_note(): spa_load(ziltest, config trusted): spa_load_retry: rewind, max txg: 50
+    vdev.c:185:vdev_dbgmsg(): file vdev '/var/tmp/ziltest/d1': best uberblock found for spa ziltest, txg=42 seq=0
+    vdev.c:185:vdev_dbgmsg(): file vdev '/var/tmp/ziltest/d1': label discarded as txg is too large (51 > 42)
+    vdev.c:185:vdev_dbgmsg(): file vdev '/var/tmp/ziltest/d1': failed to read label config
+    spa_misc.c:431:spa_load_note(): spa_load(ziltest, config untrusted): using uberblock with txg=42
+    spa_misc.c:417:spa_load_failed(): spa_load(ziltest, config untrusted): FAILED: label config unavailable
+
+Two things to read out of that.
+
+
+RESULT 1: "Verifying Log Devices" COMPLETED. zil_check_log_chain() did not block.
+----------------------------------------------------------------------------------
+The load reaches "Verifying pool data", which is past spa_ld_verify_logs().
+So the log-verify stage ran to completion even with a claimed chain whose DVA
+resolves to a hole.
+
+Confirmed directly with ftrace rather than inferred from the progress notes:
+
+    # cd /sys/kernel/debug/tracing
+    # echo function > current_tracer
+    # echo "zil_check_log_chain zil_parse zil_claim spa_check_logs zfs_blkptr_verify" > set_ftrace_filter
+    # cat set_ftrace_filter
+    zil_parse [zfs]
+    zil_claim [zfs]
+    zil_check_log_chain [zfs]
+    # echo 1 > tracing_on
+    # zpool import -d /var/tmp/ziltest -N ziltest    (exit 1)
+    # echo 0 > tracing_on
+    # grep -oE 'zil_check_log_chain|zil_parse' trace | sort | uniq -c
+          4 zil_check_log_chain
+          3 zil_parse
+
+zil_check_log_chain() was entered 4 times and zil_parse() 3 times during the
+failing import, and the import proceeded past both. Neither blocked.
+
+(spa_check_logs and zfs_blkptr_verify did not resolve as ftrace filter
+symbols on this build -- they are inlined or static-folded -- so they are
+absent from set_ftrace_filter. The two that matter did resolve.)
+
+
+RESULT 2: the failure is spa_load_verify, via the hole-vdev blkptr check
+-------------------------------------------------------------------------
+The import dies at "Verifying pool data" -- spa_load_verify() -- with
+error=5 (EIO), because a metadata blkptr fails validation:
+
+    zio.c:1135: ziltest: blkptr at ... DVA 0 has hole VDEV 2
+
+Source path, checked against the zfs-2.4.3 tag:
+
+  - traverse_zil_block(), module/zfs/dmu_traverse.c:93-98:
+
+        if (BP_IS_HOLE(bp))
+                return (0);
+        if (claim_txg == 0 &&
+            get_birth_time(td, bp) >= spa_min_claim_txg(td->td_spa))
+                return (-1);
+
+    An UNCLAIMED chain (claim_txg == 0) with a recent birth txg is skipped
+    here and never handed to the traversal callback. That is why finding 16's
+    unclaimed variant imported cleanly: spa_load_verify never looked at the
+    bad blkptr at all.
+
+    Once claim_txg != 0 the guard does not fire, the block IS traversed, and
+
+  - zfs_blkptr_verify(), module/zfs/zio.c:1271 (the format string
+    "blkptr at %px DVA %u has hole VDEV %llu"; emitted at runtime through
+    zfs_blkptr_verify_log() at zio.c:1135)
+
+    rejects it because the DVA's vdev index resolves to a hole. spa_load_verify
+    counts it as a metadata error and the load fails with EIO.
+
+
+RESULT 3: the "unexplained label artifact" from finding 16 is now explained
+----------------------------------------------------------------------------
+2026-07-31-precondition-synthesis.txt records, under "AN UNEXPLAINED ARTIFACT":
+
+    vdev.c:185: ... best uberblock found for spa ziltest, txg=42
+    vdev.c:185: ... label discarded as txg is too large (51 > 42)
+    vdev.c:185: ... failed to read label config
+    spa_misc.c:417: spa_load_failed(...): FAILED: label config unavailable
+
+  and says "Cause NOT determined. The likely reading is that skipping
+  spa_reset_logs() leaves the pool subtly inconsistent ... i.e. an artifact of
+  the debug hook, not of the hole."
+
+**That reading was wrong.** The full dbgmsg above shows the label messages are
+not the primary failure and have nothing to do with the debug hook. The
+sequence is:
+
+    1. spa_load_verify fails with EIO on the hole-vdev blkptr (the real error)
+    2. spa_load_retry rewinds:  "spa_load_retry: rewind, max txg: 50"
+    3. the rewind caps the acceptable uberblock below the label's own txg,
+       so the best uberblock is now txg=42 while the label says txg=51
+    4. the label is therefore discarded as "too large (51 > 42)"
+    5. with no usable label the retry reports "label config unavailable"
+
+Steps 2-5 are ordinary rewind machinery reacting to step 1. The debug hook is
+not implicated. Recorded here because finding 16 flagged this as an open
+"cause not determined" item and used it to justify calling the variant BLOCKED.
+
+
+ALSO TESTED
+-----------
+Read-only import of the claimed-chain state:
+
+    # zpool import -d /var/tmp/ziltest -N -o readonly=on ziltest
+    cannot import 'ziltest': I/O error
+    EXIT=1
+
+  Fails the same way. NOTE THE DIVERGENCE FROM THE INCIDENT: the affected pool
+  imported READ-ONLY without complaint and hung only on writable import
+  (CLAIMS.md 1.1, OBSERVED). This synthesised pool fails both. So the
+  claimed-chain state is not a model of the incident either -- it is a third,
+  different behaviour.
+
+Recovery import:
+
+    # zpool import -d /var/tmp/ziltest -N -F ziltest
+    cannot import 'ziltest': one or more devices is currently unavailable
+    EXIT=1
+
+
+A TEMPTING HYPOTHESIS, CHECKED AND CLOSED
+------------------------------------------
+If the hole-vdev blkptr check in zfs_blkptr_verify() were NEWER than the
+incident's build, its absence would neatly explain why the incident hung
+where this synthesis fails fast. It is not newer. Checked by fetching each
+release tag from github.com/openzfs/zfs on 2026-07-31 and grepping
+module/zfs/zio.c for the "has hole VDEV" format string:
+
+    zfs-2.2.2    present  (zio.c:1113)
+    zfs-2.3.3    present  (zio.c:1290)   <-- the incident's lineage
+    zfs-2.3.4    present  (zio.c:1290)
+    zfs-2.4.1    present  (zio.c:1271)
+    zfs-2.4.3    present  (zio.c:1271)
+    master       present  (zio.c:1266)
+
+The check is present in every release tested, including the one the incident
+ran. This hypothesis is DISPROVED, and the incident's divergence remains
+unexplained.
+
+
+WHAT THIS ESTABLISHES
+----------------------
+STATED PLAINLY: **a hole vdev plus a dangling zh_log DVA resolving to it does
+not hang a writable import on zfs-2.4.3 whether the chain is claimed or
+unclaimed.** Unclaimed: imports cleanly, exit 0 (finding 16). Claimed: fails
+fast with EIO at spa_load_verify, exit 1 (this file). Neither hangs, neither
+produces a D-state task, and in the claimed case zil_check_log_chain() and
+zil_parse() are both entered and both return.
+
+The leading candidate for the incident's missing ingredient is therefore
+closed, negatively.
+
+WHAT IT DOES NOT OVERTURN:
+  - The incident happened. CLAIMS.md 1.2's SysRq-W stack is OBSERVED.
+  - The guard gap in CLAIMS.md 3.1 and the NULL deref in 3.6 are source facts
+    and do not depend on this test.
+  - The reproducible removal-side hang (findings 10 / 14) is untouched.
+
+WHAT IT CHANGES:
+  - CLAIMS.md 4.9's "leading untested candidate" is no longer untested and is
+    no longer a candidate.
+  - CLAIMS.md 2.7's closing sentence ("Untested and now the leading lead: the
+    claimed-chain variant ... blocked by a label artifact") is superseded on
+    both halves: it is tested, and the label artifact was not a blocker but a
+    downstream symptom.
+  - Two "cause not determined" items from finding 16 are resolved: the label
+    artifact (Result 3) and why the unclaimed chain was absorbed
+    (Result 2 -- traverse_zil_block skips it before verification, which is a
+    more precise mechanism than "ZIO_FLAG_SPECULATIVE absorbed it"; both are
+    true, but the traversal skip is what keeps spa_load_verify away from it).
+  - The gap between the synthesis and the incident WIDENS rather than closes.
+    Remaining untested candidate differences, none of them now favoured over
+    any other: the incident's build (zfs-2.3.3-107-gec5aa9bfd); 140 T of data
+    across many datasets; encrypted datasets; TrueNAS middleware and
+    concurrent dataset operations; a genuinely failing device underneath
+    rather than a clean hole; and the space-map corruption (defect 2) present
+    on the same pool.
+
+REPRODUCING THIS
+----------------
+Inside guest zfs243, as root, with the stock module loaded:
+
+    rm -rf /var/tmp/ziltest
+    tar xzf /root/CLAIMED-CHAIN-state.tgz -C /var/tmp
+    echo 0 > /proc/spl/kstat/zfs/dbgmsg
+    zpool import -d /var/tmp/ziltest -N ziltest        # expect exit 1, EIO
+    cat /proc/spl/kstat/zfs/dbgmsg
+
+To re-derive the claimed state from the finding-16 state instead:
+
+    rm -rf /var/tmp/ziltest
+    tar xzf /root/precondition-state.tgz -C /var/tmp
+    zpool import -d /var/tmp/ziltest -N ziltest        # exit 0, claims chain
+    zpool export ziltest
+    zdb -e -p /var/tmp/ziltest -iiiii ziltest          # claim_txg 37, flags 0x2
+
+Evidence status: REPRODUCED (negative) on stock zfs-2.4.3. Three runs, two of
+them from an archived state restored from scratch. Not tested on 2.2.2, 2.3.4
+or 2.4.1, and not tested on the incident's own build.

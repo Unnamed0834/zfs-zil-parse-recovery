@@ -1,0 +1,297 @@
+Raw captures, ZFS 2.4.3 session, 2026-07-31
+============================================
+
+Verbatim tool and kernel output from the 2026-07-31 runs on VM `zfs243`
+(Debian 13, kernel 6.12.95+deb13-cloud-arm64, aarch64, ZFS source build at tag
+zfs-2.4.3 / commit 83020cf, module string zfs-2.4.3-0-g83020cf).
+
+The interpretation of these captures is in:
+  2026-07-31-zfs-2.4.3-test-results.txt      (findings 14)
+  2026-07-31-failmode-and-spa-log-clear.txt  (finding 15)
+  2026-07-31-precondition-synthesis.txt      (finding 16)
+
+This file is the unedited underlying output for those three, kept separately so
+a reader can check the prose against the artifact. Nothing here is summarised.
+
+
+================================================================================
+1. THE REMOVAL HANG AT failmode=wait -- /proc/<pid>/stack
+   (finding 14; the second verified stack for this hang in the repository,
+   and the first outside ZFS 2.2.2)
+================================================================================
+
+    PID=60246
+    === cmdline ===
+    zpool remove ziltest slogdev 
+    === /proc/60246/stack ===
+    [<0>] __cv_timedwait_common+0xe4/0x288 [spl]
+    [<0>] __cv_timedwait_io+0x20/0x38 [spl]
+    [<0>] zio_wait+0x14c/0x358 [zfs]
+    [<0>] arc_read+0xd78/0x1640 [zfs]
+    [<0>] zil_parse+0x1f0/0x6e8 [zfs]
+    [<0>] zil_destroy+0x210/0x280 [zfs]
+    [<0>] zil_suspend+0x520/0x680 [zfs]
+    [<0>] zil_reset+0x20/0xb0 [zfs]
+    [<0>] dmu_objset_find_impl+0x108/0x350 [zfs]
+    [<0>] dmu_objset_find_impl+0x1c0/0x350 [zfs]
+    [<0>] dmu_objset_find+0x80/0xd8 [zfs]
+    [<0>] spa_reset_logs+0x34/0x80 [zfs]
+    [<0>] spa_vdev_remove+0x6d4/0x958 [zfs]
+    [<0>] zfs_ioc_vdev_remove+0x6c/0xc8 [zfs]
+    [<0>] zfsdev_ioctl_common+0x850/0x900 [zfs]
+    [<0>] zfsdev_ioctl+0x70/0x108 [zfs]
+    [<0>] __arm64_sys_ioctl+0xbc/0x100
+    [<0>] invoke_syscall+0x60/0xe0
+    [<0>] el0_svc_common.constprop.0+0xc8/0xf0
+    [<0>] do_el0_svc+0x24/0x38
+    [<0>] el0_svc+0x38/0x148
+    [<0>] el0t_64_sync_handler+0xc8/0xe0
+    [<0>] el0t_64_sync+0x190/0x198
+    === all D-state procs ===
+      60246 D    zpool
+
+================================================================================
+2. THE SAME HANG, KERNEL HUNG-TASK WATCHDOG -- dmesg
+   Independent confirmation of section 1, emitted by the kernel at 120 s.
+================================================================================
+
+    [  846.792706] INFO: task zpool:60246 blocked for more than 120 seconds.
+    [  846.792716]       Tainted: P           OE      6.12.95+deb13-cloud-arm64 #1 Debian 6.12.95-1
+    [  846.792718] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+    [  846.792724] task:zpool           state:D stack:0     pid:60246 tgid:60246 ppid:60245  flags:0x0000040d
+    [  846.792728] Call trace:
+    [  846.792729]  __switch_to+0xf4/0x168
+    [  846.792739]  __schedule+0x398/0xf18
+    [  846.792741]  schedule+0x30/0xf0
+    [  846.792747]  schedule_timeout+0x9c/0x180
+    [  846.792748]  io_schedule_timeout+0x50/0x78
+    [  846.792750]  __cv_timedwait_common+0xe4/0x288 [spl]
+    [  846.792796]  __cv_timedwait_io+0x20/0x38 [spl]
+    [  846.792801]  zio_wait+0x14c/0x358 [zfs]
+    [  846.793021]  arc_read+0xd78/0x1640 [zfs]
+    [  846.793106]  zil_parse+0x1f0/0x6e8 [zfs]
+    [  846.793205]  zil_destroy+0x210/0x280 [zfs]
+    [  846.793281]  zil_suspend+0x520/0x680 [zfs]
+    [  846.793353]  zil_reset+0x20/0xb0 [zfs]
+    [  846.793424]  dmu_objset_find_impl+0x108/0x350 [zfs]
+    [  846.793498]  dmu_objset_find_impl+0x1c0/0x350 [zfs]
+    [  846.793569]  dmu_objset_find+0x80/0xd8 [zfs]
+    [  846.793635]  spa_reset_logs+0x34/0x80 [zfs]
+    [  846.793700]  spa_vdev_remove+0x6d4/0x958 [zfs]
+    [  846.793766]  zfs_ioc_vdev_remove+0x6c/0xc8 [zfs]
+    [  846.793832]  zfsdev_ioctl_common+0x850/0x900 [zfs]
+    [  846.793897]  zfsdev_ioctl+0x70/0x108 [zfs]
+    [  846.793964]  __arm64_sys_ioctl+0xbc/0x100
+    [  846.793967]  invoke_syscall+0x60/0xe0
+    [  846.793970]  el0_svc_common.constprop.0+0xc8/0xf0
+    [  846.793972]  do_el0_svc+0x24/0x38
+    [  846.793974]  el0_svc+0x38/0x148
+    [  846.793976]  el0t_64_sync_handler+0xc8/0xe0
+    [  846.793978]  el0t_64_sync+0x190/0x198
+
+================================================================================
+3. KERNEL PANIC AT failmode=panic -- guest serial console, verbatim
+   (finding 15)
+
+   Captured only after adding `console=tty0 console=hvc0 ignore_loglevel` to
+   the guest kernel cmdline; see ENVIRONMENT.md. The first attempt produced no
+   capturable output and was discarded as inconclusive rather than recorded as
+   an inference.
+
+   Reproduced twice. Run 2 shown in full below. Run 3 was identical apart from
+   timestamps and CPU/PID: first uncorrectable zio error at T, panic at
+   T+10.2 s (run 3) and T+10.3 s (run 2).
+================================================================================
+
+    [  243.695819] loop: module loaded
+    [  243.696152] loop0: detected capacity change from 0 to 1048576
+    [  244.123761] Buffer I/O error on dev dm-0, logical block 0, async page read
+    [  244.128086] zio pool=ziltest vdev=/dev/mapper/slogdev error=5 type=1 offset=270336 size=8192 flags=1245377
+    [  244.128207] zio pool=ziltest vdev=/dev/mapper/slogdev error=5 type=1 offset=536354816 size=8192 flags=1245377
+    [  244.128251] zio pool=ziltest vdev=/dev/mapper/slogdev error=5 type=1 offset=536616960 size=8192 flags=1245377
+    [  254.436698] Kernel panic - not syncing: Pool 'ziltest' has encountered an uncorrectable I/O failure and the failure mode property for this pool is set to panic.
+    [  254.436905] CPU: 1 UID: 0 PID: 1380 Comm: z_rd_iss Tainted: P           OE      6.12.95+deb13-cloud-arm64 #1  Debian 6.12.95-1
+    [  254.436980] Tainted: [P]=PROPRIETARY_MODULE, [O]=OOT_MODULE, [E]=UNSIGNED_MODULE
+    [  254.437015] Hardware name: Apple Inc. Apple Virtualization Generic Platform, BIOS 2103.160.2.0.0 07/11/2026
+    [  254.437061] Call trace:
+    [  254.437081]  dump_backtrace+0xd8/0x130
+    [  254.437114]  show_stack+0x20/0x38
+    [  254.437145]  dump_stack_lvl+0x60/0x80
+    [  254.437181]  dump_stack+0x18/0x28
+    [  254.437216]  panic+0x164/0x378
+    [  254.437251]  zio_suspend+0x1b0/0x1b8 [zfs]
+    [  254.437451]  zio_done+0xe84/0x1130 [zfs]
+    [  254.437618]  zio_execute+0xc0/0x170 [zfs]
+    [  254.437771]  vdev_mirror_io_start+0x11c/0x280 [zfs]
+    [  254.437930]  zio_vdev_io_start+0x2ac/0x348 [zfs]
+    [  254.438097]  zio_execute+0xc0/0x170 [zfs]
+    [  254.438262]  taskq_thread+0x300/0x650 [spl]
+    [  254.438356]  kthread+0xe8/0xf8
+    [  254.438407]  ret_from_fork+0x10/0x20
+    [  254.438456] SMP: stopping secondary CPUs
+    [  254.438536] Kernel Offset: 0x5d46be200000 from 0xffff800080000000
+    [  254.438681] PHYS_OFFSET: 0xfff0f7d900000000
+    [  254.438785] CPU features: 0x00,00000003,00222928,6607f723
+    [  254.438852] Memory Limit: none
+    [  254.476899] ---[ end Kernel panic - not syncing: Pool 'ziltest' has encountered an uncorrectable I/O failure and the failure mode property for this pool is set to panic. ]---
+
+--- run 3, the reproducibility check (same panic, persistent script log) ---
+
+    [  117.059789] loop0: detected capacity change from 0 to 1048576
+    [  117.515563] zio pool=ziltest vdev=/dev/mapper/slogdev error=5 type=1 offset=270336 size=8192 flags=1245377
+    [  117.515702] zio pool=ziltest vdev=/dev/mapper/slogdev error=5 type=1 offset=536354816 size=8192 flags=1245377
+    [  117.515826] zio pool=ziltest vdev=/dev/mapper/slogdev error=5 type=1 offset=536616960 size=8192 flags=1245377
+    [  127.716012] Kernel panic - not syncing: Pool 'ziltest' has encountered an uncorrectable I/O failure and the failure mode property for this pool is set to panic.
+    [  127.716199] CPU: 3 UID: 0 PID: 1393 Comm: z_rd_iss Tainted: P           OE      6.12.95+deb13-cloud-arm64 #1  Debian 6.12.95-1
+    [  127.716532]  zio_suspend+0x1b0/0x1b8 [zfs]
+    [  127.758294] ---[ end Kernel panic - not syncing: Pool 'ziltest' has encountered an uncorrectable I/O failure and the failure mode property for this pool is set to panic. ]---
+
+    Script log from run 3, written to a persistent path so it survived the
+    panic. It ends mid-step-6, proving the panic fires during the `zpool scrub`
+    provocation and BEFORE `zpool remove` is issued in step 7:
+
+        === 6. yank the log device out from under the live pool ===
+            swap the dm table to an error target: the device stays present but every
+            I/O fails, which is what a flickering SSD looks like to ZFS
+            provoking ZFS into noticing the failure
+        <end of file>
+
+
+================================================================================
+4. DIRECT READ AGAINST A HOLE VDEV -- `zdb -R`, with control
+   (finding 16; the probe that corrected claim 4.9's cited mechanism)
+
+   Pool exported, hole at vdev index 2. Both commands wrapped in a 60 s
+   watchdog: exit 124 would have meant BLOCKED.
+================================================================================
+
+    === THE PROBE: read a DVA on vdev 2 (the hole) ===
+    $ timeout 60 zdb -e -p /var/tmp/ziltest -R ziltest 2:20000:1000
+    Found vdev type: hole
+    ASSERT at module/zfs/vdev_mirror.c:616:vdev_mirror_io_start()
+    !spa_trust_config(zio->io_spa)
+      PID: 49747     COMM: zdb
+      TID: 49747     NAME: zdb
+    Call trace:
+    /lib/libzpool.so.7(libspl_backtrace+0x28) [0xffffbb3901c8]
+    /lib/libzpool.so.7(libspl_assertf+0x110) [0xffffbb39015c]
+    /lib/libzpool.so.7(+0x19f3dc) [0xffffbb2bf3dc]
+    /lib/libzpool.so.7(+0x1f374c) [0xffffbb31374c]
+    /lib/libzpool.so.7(zio_nowait+0x16c) [0xffffbb30f2ac]
+    zdb(+0xb770) [0xaaaabdfab770]
+    zdb -R exit=0        <-- returned immediately; NOT 124, so it did not block
+
+    === CONTROL: same read against vdev 0 (a real file vdev) ===
+    $ timeout 60 zdb -e -p /var/tmp/ziltest -R ziltest 0:20000:1000
+    Found vdev: /var/tmp/ziltest/d1
+
+    0:20000:1000
+              0 1 2 3 4 5 6 7   8 9 a b c d e f  0123456789abcdef
+    000000:  ffffffffffffffff  ffffffffffffffff  ................
+    control exit=0
+
+    Two things follow, and both matter:
+
+    - The hole read RETURNS rather than blocking. This is the empirical half
+      of claim 4.9's conclusion.
+    - It lands in `vdev_mirror_io_start()`, NOT in `vdev_missing_io_start()`.
+      Claim 4.9 originally cited the latter. A read by DVA has `io_vd == NULL`
+      and is dispatched through `vdev_mirror_ops`; the hole's own ops are never
+      reached. The same frame appears in the kernel panic trace in section 3,
+      so this is not a userspace-only artifact.
+
+    Caveat: `zdb` runs in userspace libzpool with assertions enabled, so the
+    ASSERT firing is a debug-build artifact, not the kernel's behaviour. What
+    transfers is the entry point and the fact that the read does not block.
+    The kernel-side confirmation is the successful import in
+    2026-07-31-precondition-synthesis.txt.
+
+
+================================================================================
+5. NOTE ON WHAT IS NOT IN THIS FILE
+================================================================================
+
+    - The full guest serial logs are ~58 KB each and consist mostly of boot
+      output. Only the panic blocks are reproduced above. The originals were
+      not retained in the repository.
+    - Script stdout for the 01/03/04/06/07 runs was written to /tmp inside the
+      guest, which is tmpfs and does not survive a panic or a forced power
+      cycle. The excerpts quoted in the three interpretation files were taken
+      live, while the guest was still up. Runs that needed to survive a crash
+      were redirected to the guest's home directory instead.
+    - `zdb` output for the precondition synthesis is quoted in full in
+      2026-07-31-precondition-synthesis.txt and is not duplicated here.
+
+
+================================================================================
+6. RECOVERED 2026-07-31 (later the same day): THE FINDING-14 HUNG-TASK TRACE,
+   FROM THE SYSTEMD JOURNAL
+================================================================================
+
+    Section 5 above records that the guest serial logs "were not retained in
+    the repository". That is true of the serial logs, but the trace was not
+    actually lost: systemd's journal on guest `zfs243` is persistent across
+    the forced power cycles, and it captured the hung-task watchdog output
+    independently of the serial console.
+
+    Recovered verbatim with:
+
+        limactl shell zfs243 -- sudo journalctl -b -5 -k --no-pager \
+            -S "2026-07-31 11:42" -U "2026-07-31 11:45" -o short-iso
+
+    `-b -5` is the boot in which script 07 was run on 2.4.3; that boot ended
+    in `limactl stop --force`. This is the same event already transcribed in
+    2026-07-31-zfs-2.4.3-test-results.txt, but this is the machine-generated
+    artifact rather than a transcription, so it can be diffed against the
+    quoted version.
+
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel: INFO: task zpool:60246 blocked for more than 120 seconds.
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:       Tainted: P           OE      6.12.95+deb13-cloud-arm64 #1 Debian 6.12.95-1
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel: task:zpool           state:D stack:0     pid:60246 tgid:60246 ppid:60245  flags:0x0000040d
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel: Call trace:
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  __switch_to+0xf4/0x168
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  __schedule+0x398/0xf18
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  schedule+0x30/0xf0
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  schedule_timeout+0x9c/0x180
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  io_schedule_timeout+0x50/0x78
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  __cv_timedwait_common+0xe4/0x288 [spl]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  __cv_timedwait_io+0x20/0x38 [spl]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  zio_wait+0x14c/0x358 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  arc_read+0xd78/0x1640 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  zil_parse+0x1f0/0x6e8 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  zil_destroy+0x210/0x280 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  zil_suspend+0x520/0x680 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  zil_reset+0x20/0xb0 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  dmu_objset_find_impl+0x108/0x350 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  dmu_objset_find_impl+0x1c0/0x350 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  dmu_objset_find+0x80/0xd8 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  spa_reset_logs+0x34/0x80 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  spa_vdev_remove+0x6d4/0x958 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  zfs_ioc_vdev_remove+0x6c/0xc8 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  zfsdev_ioctl_common+0x850/0x900 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  zfsdev_ioctl+0x70/0x108 [zfs]
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  __arm64_sys_ioctl+0xbc/0x100
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  invoke_syscall+0x60/0xe0
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  el0_svc_common.constprop.0+0xc8/0xf0
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  do_el0_svc+0x24/0x38
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  el0_svc+0x38/0x148
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  el0t_64_sync_handler+0xc8/0xe0
+    2026-07-31T11:43:12-05:00 lima-zfs243 kernel:  el0t_64_sync+0x190/0x198
+
+    Reading it: the chain is
+
+        zpool ioctl -> zfs_ioc_vdev_remove -> spa_vdev_remove
+                    -> spa_reset_logs -> dmu_objset_find -> zil_reset
+                    -> zil_suspend -> zil_destroy -> zil_parse
+                    -> arc_read -> zio_wait -> __cv_timedwait_io
+
+    which matches CLAIMS.md 2.1 exactly. Note that `zil_read_log_block` and
+    `spa_vdev_remove_log` do not appear: they are inlined away on this build,
+    as already noted in CLAIMS.md 2.1. `zil_destroy_sync` is likewise absent
+    for the same reason; `zil_destroy` is the surviving frame.
+
+    Note also that `txg_quiesce` does NOT appear anywhere in this boot's
+    kernel log, which is the machine-generated confirmation of CLAIMS.md 2.2's
+    "NOT REPRODUCED on 2.4.3" -- previously supported only by a live `ps`
+    reading.

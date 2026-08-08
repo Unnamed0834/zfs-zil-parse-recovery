@@ -1,0 +1,76 @@
+Post-repair pool history and scrub evidence
+============================================
+
+This is a selected excerpt from the affected TrueNAS pool's private
+`zpool history -il` output. It is not a complete raw history dump. Detailed
+dataset paths, usernames, and device identifiers are excluded because they are
+not needed for this evidence. Hostnames and the pool GUID are retained because
+they are already published throughout the incident record.
+The timestamps, transaction groups, commands, ZFS build identifiers, and
+scrub result are retained because they establish the recovery sequence.
+
+The original scrub was canceled during the recovery:
+
+2026-07-21.22:15:22 [txg:16404561] scan cancelled errors=0
+2026-07-21.22:15:25 zpool scrub -s storage
+
+The post-repair verification scrub was started after the custom repair and
+completed successfully:
+
+2026-07-22.21:46:30 [txg:16408639] scan setup func=1 mintxg=0 maxtxg=16408639
+2026-07-22.21:46:31 ioctl scrub
+    input:
+        scan_type: 1
+        scan_command: 0
+2026-07-22.21:46:31 py-libzfs: zpool scrub storage
+
+2026-07-27.06:29:18 [txg:16451342] scan done errors=0
+
+The completed scan therefore ran for approximately four days and nine hours.
+This excerpt does not preserve the final scanned-byte total; the incident
+record's 140 T figure comes from the pool status captured separately.
+
+Repeated imports on the patched recovery environment:
+
+2026-07-22.11:07:19 [txg:16404592] open pool version 5000; software version zfs-2.4.3-0-g83020cf-dirty-dist; uts cachyos-x8664 6.18.38-2-cachyos-lts x86_64
+2026-07-22.11:07:33 zpool import -f storage
+2026-07-22.11:10:51 zpool export storage
+
+2026-07-22.11:12:12 [txg:16404654] open pool version 5000; software version zfs-2.4.3-0-g83020cf-dirty-dist; uts cachyos-x8664 6.18.38-2-cachyos-lts x86_64
+2026-07-22.11:12:25 zpool import storage
+2026-07-22.11:13:51 zpool export storage
+
+2026-07-22.12:44:54 [txg:16404697] open pool version 5000; software version zfs-2.4.3-0-g83020cf-dirty-dist; uts cachyos-x8664 6.18.38-2-cachyos-lts x86_64
+2026-07-22.12:45:08 zpool import -f storage
+2026-07-22.12:47:46 zpool export -f storage
+
+2026-07-22.12:56:40 [txg:16404752] open pool version 5000; software version zfs-2.4.3-0-g83020cf-dirty-dist; uts cachyos-x8664 6.18.38-2-cachyos-lts x86_64
+2026-07-22.12:56:54 zpool import -d /dev/disk/by-id -f storage
+2026-07-22.13:01:23 zpool export storage
+
+Imports on the stock TrueNAS environment:
+
+2026-07-22.13:11:47 [txg:16404820] open pool version 5000; software version zfs-2.3.3-107-gec5aa9bfd; uts truenas 6.12.91-production+truenas x86_64
+2026-07-22.13:12:13 zpool import -f storage
+
+2026-07-22.14:17:55 [txg:16404987] open pool version 5000; software version zfs-2.3.3-107-gec5aa9bfd; uts truenas 6.12.91-production+truenas x86_64
+2026-07-22.14:18:27 zpool import -f storage
+2026-07-22.14:25:05 zpool export storage
+
+2026-07-22.14:26:43 [txg:16405080] open pool version 5000; software version zfs-2.3.3-107-gec5aa9bfd; uts truenas 6.12.91-production+truenas x86_64
+2026-07-22.14:27:05 py-libzfs: zpool import 211359596362856278 storage
+2026-07-22.15:20:25 zpool export storage
+
+2026-07-22.15:51:37 [txg:16405749] open pool version 5000; software version zfs-2.3.3-107-gec5aa9bfd; uts truenas 6.12.91-production+truenas x86_64
+2026-07-22.15:52:01 zpool import 211359596362856278 storage
+
+2026-07-23.07:54:03 [txg:16415039] open pool version 5000; software version zfs-2.3.3-107-gec5aa9bfd; uts localhost 6.12.95-production+truenas x86_64
+2026-07-23.07:55:38 zpool import 211359596362856278 -R /mnt -m -N -f -o cachefile=/data/zfs/zpool.cache
+
+The final records also show the pool and datasets being configured for the
+normal `/mnt/storage` mountpoint after the successful imports. Dataset names
+and per-dataset operations are intentionally omitted here.
+
+Evidence status: OBSERVED on the affected system. The original raw history is
+private; this file is a selected review excerpt and is not a complete
+independently reproducible capture.

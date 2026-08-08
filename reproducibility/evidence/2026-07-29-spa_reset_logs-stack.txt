@@ -1,0 +1,77 @@
+Captured: 2026-07-29
+Guest:    Ubuntu 26.04 LTS, kernel 7.0.0-28-generic, aarch64
+ZFS:      2.4.1-1ubuntu5 (stock Ubuntu build, zfs-kmod-2.4.1-1ubuntu5)
+Host:     Apple Silicon arm64, macOS 26.5.2, Lima 2.2.0 (vz)
+
+NOTE ON SUPERSESSION
+--------------------
+The IMPLICATION section below is the original framing from the day this stack
+was captured. It is preserved verbatim. The conclusion it states ("log removal
+is not atomic with respect to ZIL cleanup") was later corrected by FINDINGS.md
+finding 9: the removal IS atomic in terms of returning errors; the actual gap
+is that `spa_reset_logs()` is skipped entirely when `vs_alloc == 0`, returning
+no error at all. That skipping of the reset (not an atomicity bug) is the
+mechanism that allows the affected pool's state to arise. See
+`../FINDINGS.md` finding 9 and `../../CLAIMS.md` 4.1 (INFERRED).
+
+WHAT THIS SHOWS
+---------------
+`zpool remove <pool> <logdev>` issued against a FROZEN pool blocks in
+uninterruptible sleep. The stack proves that log-vdev removal walks every
+dataset and resets its ZIL before the vdev is converted to a hole:
+
+    spa_vdev_remove -> spa_reset_logs -> dmu_objset_find
+      -> zil_reset -> zil_suspend -> zil_commit_impl
+
+On a frozen pool no transaction group can sync, so zil_commit_impl never
+completes and the removal never returns.
+
+IMPLICATION
+-----------
+A dangling ZIL header pointing at a hole vdev can only exist if
+spa_reset_logs() failed for at least one dataset while spa_vdev_remove()
+proceeded anyway. Log removal is not atomic with respect to ZIL cleanup.
+
+HOW REPRODUCED
+--------------
+    zpool create -o cachefile=none -O sync=always t2 <disk> log <slog>
+    zpool freeze t2
+    for i in 1 2 3 4 5; do
+        dd if=/dev/urandom of=/t2/f$i bs=128k count=4 oflag=sync
+    done
+    zpool remove t2 <slog>        # blocks
+    # in another shell:
+    ps -eo pid,stat,comm | awk '$2 ~ /D/'
+    cat /proc/<pid>/stack
+
+RAW OUTPUT
+----------
+$ sudo tr '\0' ' ' < /proc/18194/cmdline
+zpool remove t2 /var/tmp/t2/slog
+
+$ sudo cat /proc/18194/stack
+[<0>] cv_wait_common+0x1c0/0x230 [spl]
+[<0>] __cv_wait+0x24/0x58 [spl]
+[<0>] zil_commit_impl+0x298/0x13a0 [zfs]
+[<0>] zil_suspend+0x160/0x408 [zfs]
+[<0>] zil_reset+0x20/0xd8 [zfs]
+[<0>] dmu_objset_find_impl+0x108/0x350 [zfs]
+[<0>] dmu_objset_find+0x80/0xf0 [zfs]
+[<0>] spa_reset_logs+0x38/0xb8 [zfs]
+[<0>] spa_vdev_remove+0x608/0x940 [zfs]
+[<0>] zfs_ioc_vdev_remove+0x6c/0xf0 [zfs]
+[<0>] zfsdev_ioctl_common+0x820/0x8f0 [zfs]
+[<0>] zfsdev_ioctl+0x74/0x120 [zfs]
+[<0>] __arm64_sys_ioctl+0xc8/0x150
+[<0>] invoke_syscall.constprop.0+0x60/0xf0
+[<0>] el0_svc_common.constprop.0+0x114/0x140
+[<0>] do_el0_svc+0x28/0x58
+[<0>] el0_svc+0x40/0x208
+[<0>] el0t_64_sync_handler+0xc0/0x110
+[<0>] el0t_64_sync+0x1b8/0x1c0
+
+NOTE
+----
+The pool was unrecoverable after this. The VM required a forced stop
+(`limactl stop --force zfslab`). This is expected: a D-state ZFS thread
+cannot be killed and holds spa_namespace_lock.

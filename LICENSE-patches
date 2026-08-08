@@ -1,0 +1,32 @@
+Patches in this repository
+==========================
+
+The contents of `patches/` are modifications to OpenZFS source files,
+specifically:
+
+    module/zfs/zil.c
+    module/zfs/space_map.c
+    module/zfs/metaslab.c
+    include/sys/space_map.h
+
+OpenZFS is licensed under the Common Development and Distribution License,
+Version 1.0 (CDDL-1.0). These patches are derivative works of that source and
+are therefore made available under the same license, so that they can be
+submitted upstream without a licensing obstacle.
+
+    Common Development and Distribution License, Version 1.0
+
+Full legal text:  https://opensource.org/license/cddl-1-0
+OpenZFS LICENSE:  https://github.com/openzfs/zfs/blob/master/LICENSE
+
+SPDX-License-Identifier: CDDL-1.0
+
+Contributor certification
+-------------------------
+
+Patches in this repository carry a `Signed-off-by` line asserting the OpenZFS
+Developer Certificate of Origin, and are offered for inclusion in OpenZFS on
+those terms.
+
+NOTE: This license does NOT apply to the prose and documentation in this
+repository, which is licensed under CC BY 4.0. See `LICENSE-docs`.

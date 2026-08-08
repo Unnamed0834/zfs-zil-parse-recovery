@@ -1,0 +1,134 @@
+Captured: 2026-07-29
+Guest:    Ubuntu 24.04.4 LTS, kernel 6.8.0-134-generic, aarch64
+ZFS:      2.2.2-0ubuntu9.4 (stock Ubuntu build)
+Host:     Apple Silicon arm64, macOS 26.5.2, Lima 2.2.0 (vz)
+
+WHAT THIS SHOWS
+---------------
+`zpool remove <pool> <logdev>` hangs UNKILLABLY when the log device's backing
+store is returning I/O errors. spa_reset_logs() walks datasets, and for a
+dataset with a live ZIL chain it reaches zil_parse(), which issues reads
+against the dead device and blocks in zio_wait().
+
+CORRECTION (added after capture)
+--------------------------------
+The line above originally read "...blocks in zio_wait() with no error path".
+That was wrong. zil_parse() DOES have an error path: it returns int, checks the
+return of zil_read_log_block(), warns via cmn_err, and breaks the loop. The
+error path is simply never reached here, because the ZIO does not complete and
+zio_wait() never returns.
+
+Why the ZIO does not complete was NOT established. This capture was taken with
+the pool at the default failmode=wait; no run with continue or panic has been
+performed. (Note that on the incident hardware failmode could not be reached
+during the load at all, for reasons confirmed in source -- see ../../CLAIMS.md
+3.23 and 3.24. The test environment does not have that constraint, because it creates its
+own pools: FAILMODE=continue sudo -E ./07-path-h-yank-live-log.sh.)
+
+Do not assume failmode is the answer. ../../CLAIMS.md 4.9 argues from source
+that a read whose DVA resolves to a hole should fail fast with ENOTSUP and
+never block, whatever failmode is set to. It blocked anyway. That is the
+sharpest open question here.
+
+See ../../CLAIMS.md 2.5, 2.6 and 4.9.
+
+VERSION SCOPE: this capture is ZFS 2.2.2. The same script hung on 2.3.4 (see
+the 2026-07-30 file) but WITHOUT a stack capture. It has never been run on
+2.4.1. This is the only verified stack for this hang in the repository.
+(Correction, 2026-07-31: that last sentence was true when written. Finding 14
+later the same day added a second verified stack, on zfs-2.4.3, corroborated
+by the kernel hung-task watchdog; see the 2026-07-31 files. This capture is
+the FIRST verified stack, no longer the only one.)
+
+This is the same defect class as the import-time hang that made the affected
+incident pool unimportable, but in the REMOVAL path rather than the import path:
+
+  import-time:  zil_check_log_chain -> zil_parse -> arc_read -> zio_wait
+  removal-time: zil_destroy_sync    -> zil_parse -> arc_read -> zio_wait
+
+REPRODUCED ON STOCK ZFS 2.2.2. No patched module, no exotic hardware.
+
+HOW REPRODUCED
+--------------
+See 07-path-h-yank-live-log.sh. Summary:
+
+  1. back the log with file -> loop -> dm-linear so it can be failed on demand
+       losetup --find --show /var/tmp/ziltest/slog
+       dmsetup create slogdev --table "0 <sectors> linear /dev/loopN 0"
+  2. zpool create -O sync=always ziltest <d1> <d2> log /dev/mapper/slogdev
+     zfs create ziltest/ds1
+  3. drive synchronous writes so the ZIL chain is live on the log device
+  4. zfs unmount ziltest/ds1     (so its ZIL cannot drain and zh_log stays set)
+  5. fail the device WITHOUT exporting the pool:
+       dmsetup suspend slogdev
+       dmsetup load    slogdev --table "0 <sectors> error"
+       dmsetup resume  slogdev
+  6. zpool remove ziltest <logdev>      <-- hangs forever here
+
+The pool must stay imported throughout. Exporting and re-importing with -m
+clears every zh_log via the SPA_LOG_CLEAR path in zil_claim(), which removes
+the condition.
+
+RAW OUTPUT
+----------
+$ ps -eo pid,stat,comm | awk '$2 ~ /D/'
+  10466 D    txg_quiesce
+  10725 D    zpool
+
+$ sudo tr '\0' ' ' < /proc/10725/cmdline
+zpool remove ziltest slogdev
+
+$ sudo cat /proc/10725/stack
+[<0>] __cv_timedwait_common+0xe0/0x278 [spl]
+[<0>] __cv_timedwait_io+0x24/0x58 [spl]
+[<0>] zio_wait+0x124/0x278 [zfs]
+[<0>] arc_read+0xc24/0x13a8 [zfs]
+[<0>] zil_read_log_block+0xcc/0x318 [zfs]
+[<0>] zil_parse+0x188/0x388 [zfs]
+[<0>] zil_destroy_sync+0x3c/0x78 [zfs]
+[<0>] zil_destroy+0x21c/0x270 [zfs]
+[<0>] zil_suspend+0x184/0x3e0 [zfs]
+[<0>] zil_reset+0x24/0xd8 [zfs]
+[<0>] dmu_objset_find_impl+0x120/0x398 [zfs]
+[<0>] dmu_objset_find_impl+0x1fc/0x398 [zfs]
+[<0>] dmu_objset_find+0x84/0xf8 [zfs]
+[<0>] spa_reset_logs+0x38/0xb0 [zfs]
+[<0>] spa_vdev_remove_log+0x1b8/0x218 [zfs]
+[<0>] spa_vdev_remove+0x1c0/0x528 [zfs]
+[<0>] zfs_ioc_vdev_remove+0x70/0xe0 [zfs]
+[<0>] zfsdev_ioctl_common+0x5a0/0x6c0 [zfs]
+
+$ sudo dmesg | tail
+[ 1844.099337] task:txg_quiesce     state:D stack:0 pid:10466 ...
+[ 1844.099353]  cv_wait_common+0x1f4/0x228 [spl]
+[ 1844.099390]  txg_quiesce+0x184/0x220 [zfs]
+[ 1844.099536]  txg_quiesce_thread+0xe0/0x120 [zfs]
+
+NOTE: txg_quiesce is also wedged, so the whole pool is stalled, not just the
+removal. The VM required `limactl stop --force`.
+
+WHY THIS MATTERS FOR THE AFFECTED POOL
+--------------------------------------
+The affected pool's SLOG was a pair of SSDs flickering between available and
+unavailable. Any `zpool remove` attempted in that state would hang exactly
+like this. The pool's own history records
+`2026-07-19.22:57:28  py-libzfs: zpool remove storageNone`, which is
+consistent with a removal attempt that did not complete cleanly.
+
+RELATIONSHIP TO THE vs_alloc GATE
+---------------------------------
+vdev_removal.c, spa_vdev_remove_log():
+
+    if (vd->vdev_stat.vs_alloc != 0)
+            error = spa_reset_logs(spa);
+
+Two failure modes follow, and neither ends cleanly:
+
+  vs_alloc != 0 and the device is failing
+      -> spa_reset_logs() runs, reaches zil_parse(), hangs forever (this file)
+
+  vs_alloc == 0 (device wiped or absent)
+      -> spa_reset_logs() is SKIPPED, the removal succeeds, and any dataset
+         holding a non-zero zh_log keeps a dangling reference into the hole
+         that the removal creates (confirmed in 06-path-g-vs-alloc-zero.sh:
+         log showed ALLOC 0, remove exit=0, hole created)
